@@ -1,0 +1,8 @@
+numpy>=1.21
+
+[visualization]
+matplotlib>=3.5
+
+[vtk]
+meshio>=5
+scipy>=1.8

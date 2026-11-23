@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: radio-free-free
+Version: 0.1.0
+Summary: Dimensionless 3D flow preparation for free-free radio transfer
+Requires-Python: >=3.9
+Requires-Dist: numpy>=1.21
+Provides-Extra: vtk
+Requires-Dist: meshio>=5; extra == "vtk"
+Requires-Dist: scipy>=1.8; extra == "vtk"
+Provides-Extra: visualization
+Requires-Dist: matplotlib>=3.5; extra == "visualization"
