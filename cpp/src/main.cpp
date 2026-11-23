@@ -15,8 +15,10 @@
 
 namespace {
 
-constexpr std::array<char, 8> kMagic{{'R', 'F', 'F', 'L', 'O', 'W', '1', '\0'}};
-constexpr std::size_t kFieldCount = 5;
+constexpr std::array<char, 8> kMagic{{'R', 'F', 'F', 'L', 'O', 'W', '2', '\0'}};
+constexpr std::array<char, 8> kLegacyMagic{{'R', 'F', 'F', 'L', 'O', 'W', '1', '\0'}};
+constexpr std::size_t kFieldCount = 4;
+constexpr std::size_t kLegacyFieldCount = 5;
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kPlanck = 6.62607015e-27;
 constexpr double kBoltzmann = 1.380649e-16;
@@ -231,9 +233,12 @@ Grid read_grid(const std::string& path) {
   }
   std::array<char, 8> magic{};
   stream.read(magic.data(), static_cast<std::streamsize>(magic.size()));
-  if (!stream || magic != kMagic) {
+  if (!stream || (magic != kMagic && magic != kLegacyMagic)) {
     throw std::runtime_error("invalid flow file magic/version");
   }
+  const bool legacy_format = magic == kLegacyMagic;
+  const std::size_t input_field_count =
+      legacy_format ? kLegacyFieldCount : kFieldCount;
 
   const auto nx = read_scalar<std::uint32_t>(stream, "nx");
   const auto ny = read_scalar<std::uint32_t>(stream, "ny");
@@ -255,25 +260,37 @@ Grid read_grid(const std::string& path) {
 
   const std::size_t max_size = std::numeric_limits<std::size_t>::max();
   if (static_cast<std::size_t>(nx) > max_size / ny ||
-      static_cast<std::size_t>(nx) * ny > max_size / nz / kFieldCount) {
+      static_cast<std::size_t>(nx) * ny >
+          max_size / nz / input_field_count) {
     throw std::runtime_error("flow grid dimensions overflow addressable memory");
   }
   const std::size_t value_count =
-      static_cast<std::size_t>(nx) * ny * nz * kFieldCount;
+      static_cast<std::size_t>(nx) * ny * nz * input_field_count;
   if (value_count > max_size / sizeof(double) ||
       value_count > static_cast<std::size_t>(
                         std::numeric_limits<std::streamsize>::max()) /
                         sizeof(double)) {
     throw std::runtime_error("flow payload is too large to read");
   }
-  grid.fields.resize(value_count);
-  stream.read(reinterpret_cast<char*>(grid.fields.data()),
+  std::vector<double> input_fields(value_count);
+  stream.read(reinterpret_cast<char*>(input_fields.data()),
               static_cast<std::streamsize>(value_count * sizeof(double)));
   if (!stream) {
     throw std::runtime_error("truncated flow field payload");
   }
   if (stream.peek() != std::char_traits<char>::eof()) {
     throw std::runtime_error("unexpected trailing data in flow file");
+  }
+  if (legacy_format) {
+    const std::size_t cell_count =
+        static_cast<std::size_t>(nx) * ny * nz;
+    grid.fields.resize(cell_count * kFieldCount);
+    for (std::size_t cell = 0; cell < cell_count; ++cell) {
+      std::copy_n(input_fields.begin() + cell * input_field_count,
+                  kFieldCount, grid.fields.begin() + cell * kFieldCount);
+    }
+  } else {
+    grid.fields.swap(input_fields);
   }
   return grid;
 }
@@ -422,8 +439,8 @@ void validate_and_copy_fields(const Grid& grid, FieldView& fields) {
           if ((f == 0 || f == 2 || f == 3) && value < 0.0) {
             throw std::runtime_error("density and abundances must be non-negative");
           }
-          if ((f == 1 || f == 4) && value <= 0.0) {
-            throw std::runtime_error("temperature and Gaunt factor must be positive");
+          if (f == 1 && value <= 0.0) {
+            throw std::runtime_error("temperature must be positive");
           }
           host_fields(i, j, k, f) = value;
         }
@@ -442,6 +459,8 @@ Kokkos::View<double**> compute_image(const Grid& grid, const FieldView& fields,
   const double temperature0 = options.temperature_scale;
   const double prefactor =
       kFreeFreeCoefficient / (frequency * frequency * frequency);
+  const double gaunt_frequency_scale = 1.2 * frequency;
+  const double gaunt_exponential_floor = std::exp(-6.9);
   const std::size_t nx = grid.nx;
   const std::size_t ny = grid.ny;
   const std::size_t nz = grid.nz;
@@ -505,10 +524,13 @@ Kokkos::View<double**> compute_image(const Grid& grid, const FieldView& fields,
           const double ion_charge2_abundance = sample_field(
               fields, x, y, z, 3, nx, ny, nz, x_min, x_max, y_min, y_max,
               z_min, z_max, dx, dy, dz);
-          const double gaunt_factor = sample_field(
-              fields, x, y, z, 4, nx, ny, nz, x_min, x_max, y_min, y_max,
-              z_min, z_max, dx, dy, dz);
           const double temperature = temperature0 * temperature_ratio;
+          const double gaunt_argument =
+              (temperature * Kokkos::sqrt(temperature)) /
+                  gaunt_frequency_scale +
+              gaunt_exponential_floor;
+          const double gaunt_factor =
+              9.77 * (1.0 + 0.13 * Kokkos::log(gaunt_argument));
           const double electron_density =
               baryon_number_density * electron_abundance;
           const double ion_charge2_density =

@@ -52,12 +52,12 @@ def main() -> None:
         )
     else:
         fields = json.loads(args.fields)
-        required_fields = set(FIELD_NAMES) - {"gaunt_factor"}
+        required_fields = set(FIELD_NAMES)
         if (not isinstance(fields, dict) or not required_fields.issubset(fields)
                 or set(fields) - set(FIELD_NAMES)):
             parser.error(
                 "--fields must map density, temperature, electron_per_baryon, "
-                "and ion_charge2_per_baryon; gaunt_factor is optional"
+                "and ion_charge2_per_baryon"
             )
         flow = resample_vtk(
             args.input,

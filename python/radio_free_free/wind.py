@@ -46,5 +46,4 @@ def spherical_wind(
         temperature=lambda x, y, z: np.ones_like(x),
         electron_per_baryon=lambda x, y, z: np.ones_like(x),
         ion_charge2_per_baryon=lambda x, y, z: np.ones_like(x),
-        gaunt_factor=lambda x, y, z: np.ones_like(x),
     )

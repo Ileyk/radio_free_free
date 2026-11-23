@@ -1,3 +1,4 @@
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,7 +6,12 @@ from pathlib import Path
 import numpy as np
 
 from radio_free_free import FlowGrid, spherical_wind
-from radio_free_free.flow import PROTON_MASS_G, _number_density_ratio
+from radio_free_free.flow import (
+    FLOW_MAGIC,
+    LEGACY_FLOW_MAGIC,
+    PROTON_MASS_G,
+    _number_density_ratio,
+)
 
 
 class FlowGridTests(unittest.TestCase):
@@ -17,13 +23,13 @@ class FlowGridTests(unittest.TestCase):
             temperature=lambda x, y, z: np.ones_like(x) * 3,
             electron_per_baryon=lambda x, y, z: np.ones_like(x),
             ion_charge2_per_baryon=lambda x, y, z: np.ones_like(x),
-            gaunt_factor=lambda x, y, z: np.ones_like(x),
         )
         self.assertEqual(flow.density.shape, (2, 2, 2))
         self.assertAlmostEqual(flow.density[0, 0, 0], 1.5)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "flow.bin"
             flow.write(path)
+            self.assertEqual(path.read_bytes()[:8], FLOW_MAGIC)
             reread = FlowGrid.read(path)
         np.testing.assert_array_equal(reread.density, flow.density)
         self.assertEqual(reread.bounds, flow.bounds)
@@ -49,8 +55,25 @@ class FlowGridTests(unittest.TestCase):
                 np.ones((1, 1, 2)),
                 np.ones((1, 1, 1)),
                 np.ones((1, 1, 1)),
-                np.ones((1, 1, 1)),
             )
+
+    def test_reads_legacy_gaunt_flow_and_discards_gaunt_field(self):
+        bounds = (0, 1, 0, 1, 0, 1)
+        fields = np.asarray([1.0, 2.0, 3.0, 4.0, 5.0], dtype="<f8")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-flow.rff"
+            with path.open("wb") as stream:
+                stream.write(LEGACY_FLOW_MAGIC)
+                stream.write(struct.pack("<III", 1, 1, 1))
+                stream.write(struct.pack("<6d", *bounds))
+                stream.write(fields.tobytes())
+            flow = FlowGrid.read(path)
+
+        self.assertEqual(flow.density.item(), 1.0)
+        self.assertEqual(flow.temperature.item(), 2.0)
+        self.assertEqual(flow.electron_per_baryon.item(), 3.0)
+        self.assertEqual(flow.ion_charge2_per_baryon.item(), 4.0)
+        self.assertFalse(hasattr(flow, "gaunt_factor"))
 
     def test_vtk_mass_and_number_density_normalize_to_n0(self):
         mass_density = np.asarray([PROTON_MASS_G * 10.0])

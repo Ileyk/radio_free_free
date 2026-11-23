@@ -15,7 +15,6 @@ _FIELD_LABELS = {
     "temperature": "Temperature / T0",
     "electron_per_baryon": "Electrons per baryon",
     "ion_charge2_per_baryon": "Ion charge-squared per baryon",
-    "gaunt_factor": "Gaunt factor",
 }
 
 _PLANES = (

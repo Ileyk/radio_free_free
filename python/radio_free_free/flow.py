@@ -12,14 +12,15 @@ from numpy.typing import NDArray
 
 FloatArray = NDArray[np.float64]
 Bounds = Tuple[float, float, float, float, float, float]
-FLOW_MAGIC = b"RFFLOW1\0"
+FLOW_MAGIC = b"RFFLOW2\0"
+LEGACY_FLOW_MAGIC = b"RFFLOW1\0"
 FIELD_NAMES = (
     "density",
     "temperature",
     "electron_per_baryon",
     "ion_charge2_per_baryon",
-    "gaunt_factor",
 )
+_LEGACY_FIELD_COUNT = 5
 PROTON_MASS_G = 1.67262192369e-24
 
 
@@ -29,7 +30,7 @@ class FlowGrid:
 
     ``density`` stores baryon number density relative to n0, and temperature
     relative to T0 supplied to the C++ postprocessor. The abundance fields
-    are number ratios per baryon, and the Gaunt factor is dimensionless.
+    are number ratios per baryon.
     """
 
     bounds: Bounds
@@ -37,7 +38,6 @@ class FlowGrid:
     temperature: FloatArray
     electron_per_baryon: FloatArray
     ion_charge2_per_baryon: FloatArray
-    gaunt_factor: FloatArray
 
     def __post_init__(self) -> None:
         bounds = np.asarray(self.bounds, dtype=np.float64)
@@ -66,8 +66,6 @@ class FlowGrid:
                 raise ValueError(f"{name} must be non-negative")
         if np.any(self.temperature <= 0):
             raise ValueError("temperature must be positive")
-        if np.any(self.gaunt_factor <= 0):
-            raise ValueError("gaunt_factor must be positive")
 
     @property
     def shape(self) -> Tuple[int, int, int]:
@@ -92,7 +90,6 @@ class FlowGrid:
         temperature: Callable[[FloatArray, FloatArray, FloatArray], FloatArray],
         electron_per_baryon: Callable[[FloatArray, FloatArray, FloatArray], FloatArray],
         ion_charge2_per_baryon: Callable[[FloatArray, FloatArray, FloatArray], FloatArray],
-        gaunt_factor: Callable[[FloatArray, FloatArray, FloatArray], FloatArray],
     ) -> "FlowGrid":
         """Evaluate dimensionless prescribed fields at Cartesian cell centers."""
         if len(shape) != 3 or any(int(n) != n or n < 1 for n in shape):
@@ -108,7 +105,6 @@ class FlowGrid:
             temperature,
             electron_per_baryon,
             ion_charge2_per_baryon,
-            gaunt_factor,
         )
         values = [np.asarray(function(x, y, z), dtype=np.float64) for function in functions]
         return cls(bounds, *values)
@@ -128,7 +124,12 @@ class FlowGrid:
     def read(cls, path: str | Path) -> "FlowGrid":
         """Read a solver interchange grid, validating its header and payload."""
         with Path(path).open("rb") as stream:
-            if stream.read(8) != FLOW_MAGIC:
+            magic = stream.read(8)
+            if magic == FLOW_MAGIC:
+                field_count = len(FIELD_NAMES)
+            elif magic == LEGACY_FLOW_MAGIC:
+                field_count = _LEGACY_FIELD_COUNT
+            else:
                 raise ValueError("not a radio_free_free flow file")
             dims_raw = stream.read(12)
             bounds_raw = stream.read(48)
@@ -136,11 +137,12 @@ class FlowGrid:
                 raise ValueError("truncated flow header")
             shape = struct.unpack("<III", dims_raw)
             bounds = struct.unpack("<6d", bounds_raw)
-            expected = int(np.prod(shape)) * len(FIELD_NAMES) * 8
+            expected = int(np.prod(shape)) * field_count * 8
             payload = stream.read()
         if len(payload) != expected:
             raise ValueError(f"flow payload has {len(payload)} bytes; expected {expected}")
-        values = np.frombuffer(payload, dtype="<f8").reshape((*shape, len(FIELD_NAMES)))
+        values = np.frombuffer(payload, dtype="<f8").reshape((*shape, field_count))
+        values = values[..., : len(FIELD_NAMES)]
         return cls(bounds, *(values[..., i].copy() for i in range(len(FIELD_NAMES))))
 
 
@@ -162,7 +164,7 @@ def resample_vtk(
     set ``density_kind="number"`` when it is already in cm^-3. Density and
     temperature are then divided by n0 and T0. Source values outside the
     convex hull are set to zero for density and abundances, and to the
-    minimum source value for temperature and Gaunt factor.
+    minimum source value for temperature.
     """
     try:
         import meshio
@@ -170,7 +172,7 @@ def resample_vtk(
     except ImportError as error:
         raise ImportError("VTK resampling requires the 'vtk' optional dependencies") from error
 
-    missing = set(FIELD_NAMES) - {"gaunt_factor"} - set(field_names)
+    missing = set(FIELD_NAMES) - set(field_names)
     if missing:
         raise ValueError(f"field_names is missing mappings for {sorted(missing)}")
     unknown = set(field_names) - set(FIELD_NAMES)
@@ -195,9 +197,6 @@ def resample_vtk(
     sampled = {}
 
     for canonical in FIELD_NAMES:
-        if canonical == "gaunt_factor" and canonical not in field_names:
-            sampled[canonical] = np.ones(shape, dtype=np.float64)
-            continue
         source_name = field_names[canonical]
         if source_name in mesh.point_data:
             points = np.asarray(mesh.points, dtype=np.float64)
@@ -215,11 +214,7 @@ def resample_vtk(
 
         if values.ndim != 1:
             raise ValueError(f"VTK field {source_name!r} must be scalar")
-        fill = (
-            float(np.min(values))
-            if canonical in ("temperature", "gaunt_factor")
-            else 0.0
-        )
+        fill = float(np.min(values)) if canonical == "temperature" else 0.0
         sampled[canonical] = griddata(
             points, values, query, method="linear", fill_value=fill
         ).reshape(shape)

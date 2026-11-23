@@ -12,7 +12,7 @@ changes the reported flux, not the image intensity or transfer solution.
 
 `FlowGrid` is a uniform, cell-centered Cartesian grid. Coordinates are in units
 of a chosen reference length `R0`; number density and temperature fields are
-ratios to `n0` and `T0`. It stores five scalar fields:
+ratios to `n0` and `T0`. It stores four scalar fields:
 
 | Field | Meaning |
 | --- | --- |
@@ -20,7 +20,6 @@ ratios to `n0` and `T0`. It stores five scalar fields:
 | `temperature` | `T / T0` |
 | `electron_per_baryon` | `n_e / n_b` |
 | `ion_charge2_per_baryon` | `(sum_i Z_i^2 n_i) / n_b` |
-| `gaunt_factor` | Free-free Gaunt factor `g_ff` |
 
 For fully ionized pure hydrogen, both abundance fields are one. For a different
 composition, supply the corresponding abundance ratios; these let the transfer
@@ -38,7 +37,7 @@ rff-flow wind wind.rff --resolution 128 128 128 \
 In this file, `R0` is the radial unit and `n0` is the number density at
 `r = R0`. The inner sphere is vacuum (stellar interior), avoiding a
 singularity at the origin and keeping it resolved by the example grid. The
-wind has `T/T0 = 1`, pure-hydrogen abundances, and `g_ff = 1`.
+wind has `T/T0 = 1` and pure-hydrogen abundances.
 
 To load simulation data, install the optional readers:
 
@@ -52,27 +51,28 @@ rff-flow vtk simulation.vtu resampled.rff \
 
 The loader uses `meshio` for VTK/VTU input and `scipy.interpolate.griddata`
 for linear resampling. `--bounds` are ordered as `xmin xmax ymin ymax zmin
-zmax`; the four required scalar fields must be present in point or cell data. Cell
-values are interpolated from cell centers. The Gaunt-factor mapping is
-optional and defaults to one. By default, the VTK density field is interpreted
+zmax`; the four scalar fields must be present in point or cell data. Cell
+values are interpolated from cell centers. By default, the VTK density field is interpreted
 as mass density in g cm^-3 and converted to number density by dividing by the
 proton mass and `--n0`. Use `--density-kind number` if the field is already a
 number density in cm^-3. `--temperature0` divides the input temperature field;
 the defaults of one are appropriate when those fields are already normalized.
-The grid bounds use the coordinate unit from the VTK file, which is converted
-to cm by `--length0` in the C++ command. Samples outside the source point
-cloud's convex hull use zero for density and abundances, and the minimum source
-value for temperature and Gaunt factor. Grid bounds retain the VTK coordinate
-values and are dimensionless in units of `R0`; `rff-transfer --length0`
-specifies the physical size of one grid coordinate unit in solar radii. The
-solver rejects non-positive Gaunt factors.
+Samples outside the source point cloud's convex hull use zero for density and
+abundances, and the minimum source value for temperature. The transfer solver
+computes the frequency-dependent Gaunt factor from this temperature field.
+Grid bounds retain
+the VTK coordinate values and are dimensionless in units of `R0`;
+`rff-transfer --length0` specifies the physical size of one grid coordinate
+unit in solar radii.
 
 `FlowGrid.write()` writes a compact little-endian binary file with a versioned
-header, dimensions, bounds, and the five cell fields. The layout is x-major,
+header, dimensions, bounds, and the four cell fields. The layout is x-major,
 then y, then z, with fields contiguous per cell. `FlowGrid.read()` can be used
 to inspect a generated file. Existing files created with the former mass
 density normalization contain the same density ratios when `n0 = rho0 / m_p`;
-the binary file itself does not store either physical normalization.
+the binary file itself does not store either physical normalization. The new
+format omits the Gaunt factor; older version-1 files are still readable, with
+their stored Gaunt-factor field ignored.
 
 ## Interactive flow viewer
 
@@ -87,9 +87,9 @@ The viewer opens three separate windows for YZ, XZ, and XY slices. Each window
 shows the slice nearest the requested `--x`, `--y`, or `--z` coordinate. Omit
 any coordinate to use the middle grid cell on that axis; coordinates outside
 the grid bounds are rejected. Use `--field` to choose `density`,
-`temperature`, `electron_per_baryon`,
-`ion_charge2_per_baryon`, or `gaunt_factor`; all three windows show the chosen
-field with a consistent color scale. Coordinates are displayed in the flow
+`temperature`, `electron_per_baryon`, or `ion_charge2_per_baryon`; all three
+windows show the chosen field with a consistent color scale. Coordinates are
+displayed in the flow
 grid's `R0` units. A graphical Matplotlib backend is required.
 
 ## Plot radio outputs
@@ -128,6 +128,7 @@ units the transfer uses
 n_b       = n0 * density
 n_e       = n_b * electron_per_baryon
 n_i,Z2    = n_b * ion_charge2_per_baryon
+g_ff      = 9.77 (1 + 0.13 ln(T^(3/2) / (1.2 nu) + exp(-6.9)))
 alpha_nu  = 3.692e8 T^(-1/2) nu^(-3)
             n_e n_i,Z2 (1 - exp(-h nu / k T)) g_ff   [cm^-1]
 j_nu      = alpha_nu B_nu(T)
@@ -138,6 +139,10 @@ The transfer is integrated along each ray using the exact constant-step update
 `I_out = I_in exp(-tau) + B_nu(T) (1 - exp(-tau))`. Both exponentials use
 stable forms near zero optical depth. This includes stimulated emission and
 does not assume the Rayleigh-Jeans limit.
+Here `T` is the local physical temperature in K and `nu` is the observing
+frequency in Hz. `rff-transfer` computes `g_ff` from the interpolated
+temperature at every transfer sample. In image mode it uses the requested
+frequency; in spectrum mode it recomputes the factor for each frequency.
 
 The flow preparation and viewing tools operate on dimensionless coordinates
 in units of `R0`. Set the physical size of one `R0` coordinate unit with
@@ -167,8 +172,8 @@ The spectrum CSV contains frequency in Hz and the projected intensity-area
 integral in `erg s^-1 Hz^-1`. The viewing-angle options apply to both modes.
 `rff-plot` converts this integral to observed flux density using
 `F_nu = integral / distance_cm^2`; flux density is displayed in mJy. The `.rff`
-Gaunt-factor field is treated as frequency-independent across the spectrum
-band. Output CSV metadata stores `n0`, `T0`, and `R0` for spectrum scale
+flow no longer contains a Gaunt-factor field. Output CSV metadata stores
+`n0`, `T0`, and `R0` for spectrum scale
 annotation; frequency values remain in Hz in the file and are displayed in
 GHz. The CSV records `length0_cm` after converting the input solar radii to
 centimeters.

@@ -35,7 +35,6 @@ class OrthogonalSliceTests(unittest.TestCase):
             ones,
             ones,
             ones,
-            ones,
         )
         self.assertEqual(slice_location(flow, 0, 0.1), (0, 0.5))
         self.assertEqual(slice_location(flow, 1, 2.4), (2, 2.5))
@@ -60,7 +59,6 @@ class OrthogonalSliceTests(unittest.TestCase):
             ones,
             ones,
             ones,
-            ones,
         )
         windows = create_slice_windows(flow, slice_coordinates=(0.1, 2.4, 0.6))
         try:
@@ -78,7 +76,6 @@ class OrthogonalSliceTests(unittest.TestCase):
         singleton = np.ones((1, 1, 1))
         flow = FlowGrid(
             (0, 1, 0, 1, 0, 1),
-            singleton,
             singleton,
             singleton,
             singleton,
