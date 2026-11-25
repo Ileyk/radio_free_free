@@ -27,8 +27,23 @@ constexpr double kBoltzmann = 1.380649e-16;
 constexpr double kLightSpeed = 2.99792458e10;
 constexpr double kFreeFreeCoefficient = 3.692e8;
 constexpr double kSolarRadiusCm = 6.957e10;
+constexpr double kSqrtThreeOverPi = 1.7320508075688772935 / kPi;
 using FieldView = Kokkos::View<double****, Kokkos::LayoutRight>;
 using RaySampleView = Kokkos::View<double****, Kokkos::LayoutRight>;
+
+KOKKOS_INLINE_FUNCTION
+double free_free_gaunt_factor(const double temperature,
+                              const double frequency,
+                              const double ionic_charge) {
+  const double log_argument =
+      Kokkos::log(ionic_charge) + Kokkos::log(frequency / 1.0e9) -
+      1.5 * Kokkos::log(temperature / 1.0e4);
+  const double exponent = 5.960 - kSqrtThreeOverPi * log_argument;
+  if (exponent > 1.0) {
+    return exponent + Kokkos::log(1.0 + Kokkos::exp(1.0 - exponent));
+  }
+  return 1.0 + Kokkos::log(1.0 + Kokkos::exp(exponent - 1.0));
+}
 
 KOKKOS_INLINE_FUNCTION
 double one_minus_exp_negative(const double value) {
@@ -470,7 +485,7 @@ RaySampleView precompute_ray_samples(const Grid& grid, const FieldView& fields,
                                      const ViewGeometry& view,
                                      const Options& options,
                                      const bool has_occultation) {
-  RaySampleView samples("ray_samples", view.nx, view.ny, view.nlos, 3);
+  RaySampleView samples("ray_samples", view.nx, view.ny, view.nlos, 4);
   const double number_density0 = options.number_density_scale;
   const double temperature0 = options.temperature_scale;
   const std::size_t nx = grid.nx;
@@ -523,6 +538,7 @@ RaySampleView precompute_ray_samples(const Grid& grid, const FieldView& fields,
                                  y_min, y_max, z_min, z_max, dx, dy, dz)
                   : 0.0;
           samples(i, j, k, 2) = occultation_mask;
+          samples(i, j, k, 3) = 0.0;
           if (occultation_mask > 0.5) {
             samples(i, j, k, 0) = 0.0;
             samples(i, j, k, 1) = 0.0;
@@ -554,6 +570,10 @@ RaySampleView precompute_ray_samples(const Grid& grid, const FieldView& fields,
               baryon_number_density * ion_charge2_abundance;
           samples(i, j, k, 0) = temperature;
           samples(i, j, k, 1) = electron_density * ion_charge2_density;
+          samples(i, j, k, 3) =
+              electron_abundance > 0.0
+                  ? ion_charge2_abundance / electron_abundance
+                  : 0.0;
         }
       });
   Kokkos::fence();
@@ -567,8 +587,6 @@ Kokkos::View<double**> compute_image(const RaySampleView& samples,
   Kokkos::View<double**> image("intensity_image", view.nx, view.ny);
   const double prefactor =
       kFreeFreeCoefficient / (frequency * frequency * frequency);
-  const double gaunt_frequency_scale = 1.2 * frequency;
-  const double gaunt_exponential_floor = std::exp(-6.9);
   const std::size_t image_ny = view.ny;
   const std::size_t nlos = view.nlos;
   const double step = view.ds * length_scale_cm;
@@ -587,16 +605,14 @@ Kokkos::View<double**> compute_image(const RaySampleView& samples,
             continue;
           }
           const double temperature = samples(i, j, k, 0);
-          if (temperature == 0.0) {
+          const double emission_measure = samples(i, j, k, 1);
+          const double ionic_charge = samples(i, j, k, 3);
+          if (temperature == 0.0 || emission_measure == 0.0 ||
+              ionic_charge == 0.0) {
             continue;
           }
-          const double emission_measure = samples(i, j, k, 1);
-          const double gaunt_argument =
-              (temperature * Kokkos::sqrt(temperature)) /
-                  gaunt_frequency_scale +
-              gaunt_exponential_floor;
           const double gaunt_factor =
-              9.77 * (1.0 + 0.13 * Kokkos::log(gaunt_argument));
+              free_free_gaunt_factor(temperature, frequency, ionic_charge);
           const double x_nu =
               kPlanck * frequency / (kBoltzmann * temperature);
           const double stimulated_emission = one_minus_exp_negative(x_nu);

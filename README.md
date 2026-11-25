@@ -154,7 +154,8 @@ units the transfer uses
 n_b       = n0 * density
 n_e       = n_b * electron_per_baryon
 n_i,Z2    = n_b * ion_charge2_per_baryon
-g_ff      = 9.77 (1 + 0.13 ln(T^(3/2) / (1.2 nu) + exp(-6.9)))
+Z_i,eff   = ion_charge2_per_baryon / electron_per_baryon
+g_ff      = ln(exp(5.960 - sqrt(3)/pi ln(Z_i,eff nu_9 T_4^(-3/2))) + e)
 alpha_nu  = 3.692e8 T^(-1/2) nu^(-3)
             n_e n_i,Z2 (1 - exp(-h nu / k T)) g_ff   [cm^-1]
 j_nu      = alpha_nu B_nu(T)
@@ -166,9 +167,13 @@ The transfer is integrated along each ray using the exact constant-step update
 stable forms near zero optical depth. This includes stimulated emission and
 does not assume the Rayleigh-Jeans limit.
 Here `T` is the local physical temperature in K and `nu` is the observing
-frequency in Hz. `rff-transfer` computes `g_ff` from the interpolated
-temperature at every transfer sample. In image mode it uses the requested
-frequency; in spectrum mode it recomputes the factor for each frequency.
+frequency in Hz; `T_4 = T / 10^4 K` and `nu_9 = nu / 10^9 Hz`. For a flow
+with one ion species, `Z_i,eff` equals its ionic charge number. For mixtures,
+the flow's aggregate composition fields define the effective value as
+`(sum_i Z_i^2 n_i) / (sum_i Z_i n_i)`. `rff-transfer` computes `g_ff` from
+the interpolated temperature and effective charge at every transfer sample.
+In image mode it uses the requested frequency; in spectrum mode it recomputes
+the factor for each frequency.
 
 The flow preparation and viewing tools operate on dimensionless coordinates
 in units of `R0`. Set the physical size of one `R0` coordinate unit with
