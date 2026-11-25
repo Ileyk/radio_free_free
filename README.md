@@ -12,7 +12,8 @@ changes the reported flux, not the image intensity or transfer solution.
 
 `FlowGrid` is a uniform, cell-centered Cartesian grid. Coordinates are in units
 of a chosen reference length `R0`; number density and temperature fields are
-ratios to `n0` and `T0`. It stores four scalar fields:
+ratios to `n0` and `T0`. Along with the occultation mask, it stores four
+physical scalar fields:
 
 | Field | Meaning |
 | --- | --- |
@@ -20,6 +21,9 @@ ratios to `n0` and `T0`. It stores four scalar fields:
 | `temperature` | `T / T0` |
 | `electron_per_baryon` | `n_e / n_b` |
 | `ion_charge2_per_baryon` | `(sum_i Z_i^2 n_i) / n_b` |
+
+The occultation mask is a fifth, dimensionless field: zero means transparent,
+one means opaque. It defaults to zero.
 
 For fully ionized pure hydrogen, both abundance fields are one. For a different
 composition, supply the corresponding abundance ratios; these let the transfer
@@ -35,9 +39,12 @@ rff-flow wind wind.rff --resolution 128 128 128 \
 ```
 
 In this file, `R0` is the radial unit and `n0` is the number density at
-`r = R0`. The inner sphere is vacuum (stellar interior), avoiding a
-singularity at the origin and keeping it resolved by the example grid. The
-wind has `T/T0 = 1` and pure-hydrogen abundances.
+`r = R0`. `outer-radius` sets a spherical wind cutoff; the Cartesian grid
+extends to the enclosing cube, but density, temperature, and abundances are
+zero outside the sphere. The inner sphere is vacuum (stellar interior),
+avoiding a singularity at the origin and keeping it resolved by the example
+grid. Within the spherical domain the wind has `T/T0 = 1` and pure-hydrogen
+abundances.
 
 To load simulation data, install the optional readers:
 
@@ -66,13 +73,36 @@ the VTK coordinate values and are dimensionless in units of `R0`;
 unit in solar radii.
 
 `FlowGrid.write()` writes a compact little-endian binary file with a versioned
-header, dimensions, bounds, and the four cell fields. The layout is x-major,
-then y, then z, with fields contiguous per cell. `FlowGrid.read()` can be used
-to inspect a generated file. Existing files created with the former mass
-density normalization contain the same density ratios when `n0 = rho0 / m_p`;
-the binary file itself does not store either physical normalization. The new
-format omits the Gaunt factor; older version-1 files are still readable, with
-their stored Gaunt-factor field ignored.
+header, dimensions, bounds, and the four physical fields plus the occultation
+mask. The layout is x-major, then y, then z, with fields contiguous per cell.
+`FlowGrid.read()` can be used to inspect a generated file. Existing files
+created with the former mass-density normalization contain the same density
+ratios when `n0 = rho0 / m_p`; the binary file itself does not store either
+physical normalization. Version-1 files with a stored Gaunt factor and
+version-2 files without a mask remain readable; their absent mask is treated
+as fully transparent.
+
+## Add an opaque volume
+
+After creating a flow file, use `rff-occult` to add a solid sphere or finite
+cylinder. The center and dimensions use the dimensionless flow coordinate
+units (`R0`):
+
+```sh
+rff-occult wind.rff occulted-wind.rff --shape sphere \
+  --center 0 0 0 --radius 1.5
+rff-occult wind.rff occulted-wind.rff --shape cylinder \
+  --center 1 0 0 --radius 0.5 --height 3 --axis z
+```
+
+The cylinder is centered on the given coordinates; `--height` is its full
+length, and `--axis` selects x, y, or z (default z). The mask is sampled at
+flow cell centers. Run `rff-transfer` with the resulting output file as its
+input to activate occultation. A ray crossing an opaque cell loses all
+background emission behind it, while foreground flow remains visible.
+Occulting volumes can also be inspected with `rff-view`: their slice boundary
+is drawn in cyan over the selected flow field, or select `--field
+occultation_mask` to view the mask itself.
 
 ## Interactive flow viewer
 
@@ -80,17 +110,18 @@ Install the optional Matplotlib dependency and open a resampled flow file:
 
 ```sh
 python -m pip install -e '.[visualization]'
-rff-view wind.rff --x 0 --y 0 --z 0 --field density
+rff-view occulted-wind.rff --x 0 --y 0 --z 0 --field density
 ```
 
 The viewer opens three separate windows for YZ, XZ, and XY slices. Each window
 shows the slice nearest the requested `--x`, `--y`, or `--z` coordinate. Omit
 any coordinate to use the middle grid cell on that axis; coordinates outside
 the grid bounds are rejected. Use `--field` to choose `density`,
-`temperature`, `electron_per_baryon`, or `ion_charge2_per_baryon`; all three
-windows show the chosen field with a consistent color scale. Coordinates are
-displayed in the flow
-grid's `R0` units. A graphical Matplotlib backend is required.
+`temperature`, `electron_per_baryon`, `ion_charge2_per_baryon`, or
+`occultation_mask`; all three windows show the chosen field with a consistent
+color scale. Occulting-surface intersections are overlaid in cyan.
+Coordinates are displayed in the flow grid's `R0` units. A graphical
+Matplotlib backend is required.
 
 ## Plot radio outputs
 

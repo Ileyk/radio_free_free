@@ -15,9 +15,11 @@
 
 namespace {
 
-constexpr std::array<char, 8> kMagic{{'R', 'F', 'F', 'L', 'O', 'W', '2', '\0'}};
+constexpr std::array<char, 8> kMagic{{'R', 'F', 'F', 'L', 'O', 'W', '3', '\0'}};
+constexpr std::array<char, 8> kPreviousMagic{{'R', 'F', 'F', 'L', 'O', 'W', '2', '\0'}};
 constexpr std::array<char, 8> kLegacyMagic{{'R', 'F', 'F', 'L', 'O', 'W', '1', '\0'}};
-constexpr std::size_t kFieldCount = 4;
+constexpr std::size_t kFieldCount = 5;
+constexpr std::size_t kPreviousFieldCount = 4;
 constexpr std::size_t kLegacyFieldCount = 5;
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kPlanck = 6.62607015e-27;
@@ -26,6 +28,7 @@ constexpr double kLightSpeed = 2.99792458e10;
 constexpr double kFreeFreeCoefficient = 3.692e8;
 constexpr double kSolarRadiusCm = 6.957e10;
 using FieldView = Kokkos::View<double****, Kokkos::LayoutRight>;
+using RaySampleView = Kokkos::View<double****, Kokkos::LayoutRight>;
 
 KOKKOS_INLINE_FUNCTION
 double one_minus_exp_negative(const double value) {
@@ -65,6 +68,7 @@ struct Grid {
   std::size_t nz;
   std::array<double, 6> bounds;
   std::vector<double> fields;
+  bool has_occultation = false;
 };
 
 struct Vector3 {
@@ -233,12 +237,13 @@ Grid read_grid(const std::string& path) {
   }
   std::array<char, 8> magic{};
   stream.read(magic.data(), static_cast<std::streamsize>(magic.size()));
-  if (!stream || (magic != kMagic && magic != kLegacyMagic)) {
+  if (!stream ||
+      (magic != kMagic && magic != kPreviousMagic && magic != kLegacyMagic)) {
     throw std::runtime_error("invalid flow file magic/version");
   }
-  const bool legacy_format = magic == kLegacyMagic;
+  const bool has_occultation_mask = magic == kMagic;
   const std::size_t input_field_count =
-      legacy_format ? kLegacyFieldCount : kFieldCount;
+      magic == kPreviousMagic ? kPreviousFieldCount : kLegacyFieldCount;
 
   const auto nx = read_scalar<std::uint32_t>(stream, "nx");
   const auto ny = read_scalar<std::uint32_t>(stream, "ny");
@@ -259,9 +264,11 @@ Grid read_grid(const std::string& path) {
   }
 
   const std::size_t max_size = std::numeric_limits<std::size_t>::max();
+  const std::size_t allocation_field_count =
+      std::max(input_field_count, kFieldCount);
   if (static_cast<std::size_t>(nx) > max_size / ny ||
       static_cast<std::size_t>(nx) * ny >
-          max_size / nz / input_field_count) {
+          max_size / nz / allocation_field_count) {
     throw std::runtime_error("flow grid dimensions overflow addressable memory");
   }
   const std::size_t value_count =
@@ -281,16 +288,17 @@ Grid read_grid(const std::string& path) {
   if (stream.peek() != std::char_traits<char>::eof()) {
     throw std::runtime_error("unexpected trailing data in flow file");
   }
-  if (legacy_format) {
-    const std::size_t cell_count =
-        static_cast<std::size_t>(nx) * ny * nz;
-    grid.fields.resize(cell_count * kFieldCount);
-    for (std::size_t cell = 0; cell < cell_count; ++cell) {
-      std::copy_n(input_fields.begin() + cell * input_field_count,
-                  kFieldCount, grid.fields.begin() + cell * kFieldCount);
-    }
-  } else {
-    grid.fields.swap(input_fields);
+  const std::size_t cell_count = static_cast<std::size_t>(nx) * ny * nz;
+  grid.fields.resize(cell_count * kFieldCount);
+  for (std::size_t cell = 0; cell < cell_count; ++cell) {
+    std::copy_n(input_fields.begin() + cell * input_field_count,
+                kFieldCount - 1, grid.fields.begin() + cell * kFieldCount);
+    grid.fields[cell * kFieldCount + kFieldCount - 1] =
+        has_occultation_mask
+            ? input_fields[cell * input_field_count + kFieldCount - 1]
+            : 0.0;
+    grid.has_occultation |=
+        grid.fields[cell * kFieldCount + kFieldCount - 1] > 0.0;
   }
   return grid;
 }
@@ -439,10 +447,18 @@ void validate_and_copy_fields(const Grid& grid, FieldView& fields) {
           if ((f == 0 || f == 2 || f == 3) && value < 0.0) {
             throw std::runtime_error("density and abundances must be non-negative");
           }
-          if (f == 1 && value <= 0.0) {
-            throw std::runtime_error("temperature must be positive");
+          if (f == 1 && value < 0.0) {
+            throw std::runtime_error("temperature must be non-negative");
+          }
+          if (f == 4 && (value < 0.0 || value > 1.0)) {
+            throw std::runtime_error(
+                "occultation mask values must be between zero and one");
           }
           host_fields(i, j, k, f) = value;
+        }
+        if (grid.fields[cell] > 0.0 && grid.fields[cell + 1] <= 0.0) {
+          throw std::runtime_error(
+              "temperature must be positive where density is non-zero");
         }
       }
     }
@@ -450,17 +466,13 @@ void validate_and_copy_fields(const Grid& grid, FieldView& fields) {
   Kokkos::deep_copy(fields, host_fields);
 }
 
-Kokkos::View<double**> compute_image(const Grid& grid, const FieldView& fields,
+RaySampleView precompute_ray_samples(const Grid& grid, const FieldView& fields,
                                      const ViewGeometry& view,
                                      const Options& options,
-                                     const double frequency) {
-  Kokkos::View<double**> image("intensity_image", view.nx, view.ny);
+                                     const bool has_occultation) {
+  RaySampleView samples("ray_samples", view.nx, view.ny, view.nlos, 3);
   const double number_density0 = options.number_density_scale;
   const double temperature0 = options.temperature_scale;
-  const double prefactor =
-      kFreeFreeCoefficient / (frequency * frequency * frequency);
-  const double gaunt_frequency_scale = 1.2 * frequency;
-  const double gaunt_exponential_floor = std::exp(-6.9);
   const std::size_t nx = grid.nx;
   const std::size_t ny = grid.ny;
   const std::size_t nz = grid.nz;
@@ -475,7 +487,6 @@ Kokkos::View<double**> compute_image(const Grid& grid, const FieldView& fields,
   const double dx = (x_max - x_min) / nx;
   const double dy = (y_max - y_min) / ny;
   const double dz = (z_max - z_min) / nz;
-  const double step = view.ds * options.length_scale_cm;
   const double u_min = view.u_min;
   const double v_min = view.v_min;
   const double s_min = view.s_min;
@@ -493,7 +504,7 @@ Kokkos::View<double**> compute_image(const Grid& grid, const FieldView& fields,
   const double losz = view.los.z;
 
   Kokkos::parallel_for(
-      "free_free_ray_transfer",
+      "precompute_ray_samples",
       Kokkos::RangePolicy<Kokkos::IndexType<std::size_t>>(
           0, view.nx * view.ny),
       KOKKOS_LAMBDA(const std::size_t pixel) {
@@ -501,18 +512,30 @@ Kokkos::View<double**> compute_image(const Grid& grid, const FieldView& fields,
         const std::size_t j = pixel % image_ny;
         const double u_coord = u_min + (i + 0.5) * du;
         const double v_coord = v_min + (j + 0.5) * dv;
-        double intensity = 0.0;
         for (std::size_t k = 0; k < nlos; ++k) {
           const double s_coord = s_min + (k + 0.5) * ds;
           const double x = ux * u_coord + vx * v_coord + losx * s_coord;
           const double y = uy * u_coord + vy * v_coord + losy * s_coord;
           const double z = uz * u_coord + vz * v_coord + losz * s_coord;
+          const double occultation_mask =
+              has_occultation
+                  ? sample_field(fields, x, y, z, 4, nx, ny, nz, x_min, x_max,
+                                 y_min, y_max, z_min, z_max, dx, dy, dz)
+                  : 0.0;
+          samples(i, j, k, 2) = occultation_mask;
+          if (occultation_mask > 0.5) {
+            samples(i, j, k, 0) = 0.0;
+            samples(i, j, k, 1) = 0.0;
+            continue;
+          }
           const double density_ratio = sample_field(
               fields, x, y, z, 0, nx, ny, nz, x_min, x_max, y_min, y_max,
               z_min, z_max, dx, dy, dz);
           const double baryon_number_density =
               number_density0 * density_ratio;
           if (baryon_number_density == 0.0) {
+            samples(i, j, k, 0) = 0.0;
+            samples(i, j, k, 1) = 0.0;
             continue;
           }
           const double temperature_ratio = sample_field(
@@ -525,22 +548,61 @@ Kokkos::View<double**> compute_image(const Grid& grid, const FieldView& fields,
               fields, x, y, z, 3, nx, ny, nz, x_min, x_max, y_min, y_max,
               z_min, z_max, dx, dy, dz);
           const double temperature = temperature0 * temperature_ratio;
+          const double electron_density =
+              baryon_number_density * electron_abundance;
+          const double ion_charge2_density =
+              baryon_number_density * ion_charge2_abundance;
+          samples(i, j, k, 0) = temperature;
+          samples(i, j, k, 1) = electron_density * ion_charge2_density;
+        }
+      });
+  Kokkos::fence();
+  return samples;
+}
+
+Kokkos::View<double**> compute_image(const RaySampleView& samples,
+                                     const ViewGeometry& view,
+                                     const double frequency,
+                                     const double length_scale_cm) {
+  Kokkos::View<double**> image("intensity_image", view.nx, view.ny);
+  const double prefactor =
+      kFreeFreeCoefficient / (frequency * frequency * frequency);
+  const double gaunt_frequency_scale = 1.2 * frequency;
+  const double gaunt_exponential_floor = std::exp(-6.9);
+  const std::size_t image_ny = view.ny;
+  const std::size_t nlos = view.nlos;
+  const double step = view.ds * length_scale_cm;
+
+  Kokkos::parallel_for(
+      "free_free_ray_transfer",
+      Kokkos::RangePolicy<Kokkos::IndexType<std::size_t>>(
+          0, view.nx * view.ny),
+      KOKKOS_LAMBDA(const std::size_t pixel) {
+        const std::size_t i = pixel / image_ny;
+        const std::size_t j = pixel % image_ny;
+        double intensity = 0.0;
+        for (std::size_t k = 0; k < nlos; ++k) {
+          if (samples(i, j, k, 2) > 0.5) {
+            intensity = 0.0;
+            continue;
+          }
+          const double temperature = samples(i, j, k, 0);
+          if (temperature == 0.0) {
+            continue;
+          }
+          const double emission_measure = samples(i, j, k, 1);
           const double gaunt_argument =
               (temperature * Kokkos::sqrt(temperature)) /
                   gaunt_frequency_scale +
               gaunt_exponential_floor;
           const double gaunt_factor =
               9.77 * (1.0 + 0.13 * Kokkos::log(gaunt_argument));
-          const double electron_density =
-              baryon_number_density * electron_abundance;
-          const double ion_charge2_density =
-              baryon_number_density * ion_charge2_abundance;
           const double x_nu =
               kPlanck * frequency / (kBoltzmann * temperature);
           const double stimulated_emission = one_minus_exp_negative(x_nu);
           const double alpha =
               prefactor * Kokkos::sqrt(1.0 / temperature) *
-              electron_density * ion_charge2_density * stimulated_emission *
+              emission_measure * stimulated_emission *
               gaunt_factor;
           const double tau = alpha * step;
           const double transmitted = Kokkos::exp(-tau);
@@ -656,10 +718,12 @@ void run(const Options& options) {
   FieldView fields("flow_fields", grid.nx, grid.ny, grid.nz, kFieldCount);
   validate_and_copy_fields(grid, fields);
   const ViewGeometry view = make_view_geometry(grid, options);
+  const RaySampleView ray_samples =
+      precompute_ray_samples(grid, fields, view, options, grid.has_occultation);
 
   if (options.mode == "image") {
-    const auto image =
-        compute_image(grid, fields, view, options, options.frequency);
+    const auto image = compute_image(
+        ray_samples, view, options.frequency, options.length_scale_cm);
     const double pixel_area_cm2 =
         view.du * view.dv * options.length_scale_cm * options.length_scale_cm;
     write_image(options.output, view, image, options.frequency, pixel_area_cm2,
@@ -680,7 +744,8 @@ void run(const Options& options) {
   std::vector<double> projected_intensity_areas;
   projected_intensity_areas.reserve(frequencies.size());
   for (const double frequency : frequencies) {
-    const auto image = compute_image(grid, fields, view, options, frequency);
+    const auto image =
+        compute_image(ray_samples, view, frequency, options.length_scale_cm);
     projected_intensity_areas.push_back(
         integrate_image(image, view, options.length_scale_cm)
             .projected_intensity_area);

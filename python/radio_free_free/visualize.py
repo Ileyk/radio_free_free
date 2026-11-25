@@ -15,6 +15,7 @@ _FIELD_LABELS = {
     "temperature": "Temperature / T0",
     "electron_per_baryon": "Electrons per baryon",
     "ion_charge2_per_baryon": "Ion charge-squared per baryon",
+    "occultation_mask": "Opaque volume mask",
 }
 
 _PLANES = (
@@ -109,9 +110,46 @@ def create_slice_windows(
             extent=extent,
             aspect="auto",
             interpolation="nearest",
-            vmin=float(np.min(values)),
-            vmax=float(np.max(values)),
+            vmin=0.0 if field_name == "occultation_mask" else float(np.min(values)),
+            vmax=1.0 if field_name == "occultation_mask" else float(np.max(values)),
         )
+        mask_slice = orthogonal_slice(
+            flow.occultation_mask, normal_axis, initial_index
+        )
+        if (
+            min(mask_slice.shape) >= 2
+            and np.min(mask_slice) < 0.5
+            and np.max(mask_slice) > 0.5
+        ):
+            horizontal_centers = (
+                flow.bounds[2 * horizontal_axis]
+                + (np.arange(flow.shape[horizontal_axis]) + 0.5)
+                * flow.spacing[horizontal_axis]
+            )
+            vertical_centers = (
+                flow.bounds[2 * vertical_axis]
+                + (np.arange(flow.shape[vertical_axis]) + 0.5)
+                * flow.spacing[vertical_axis]
+            )
+            axis.contour(
+                horizontal_centers,
+                vertical_centers,
+                mask_slice,
+                levels=(0.5,),
+                colors=("cyan",),
+                linewidths=1.5,
+            )
+            from matplotlib.lines import Line2D
+
+            axis.legend(
+                handles=[
+                    Line2D(
+                        [], [], color="cyan", linewidth=1.5,
+                        label="Opaque surface",
+                    )
+                ],
+                loc="upper right",
+            )
         axis.set_xlabel(f"{horizontal_name} / R0")
         axis.set_ylabel(f"{vertical_name} / R0")
         axis.set_title(

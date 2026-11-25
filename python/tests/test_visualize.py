@@ -8,6 +8,7 @@ from radio_free_free.visualize import (
     slice_location,
 )
 from radio_free_free import FlowGrid
+from radio_free_free.occulter import add_occulting_shape
 
 
 class OrthogonalSliceTests(unittest.TestCase):
@@ -85,6 +86,43 @@ class OrthogonalSliceTests(unittest.TestCase):
         try:
             self.assertEqual(len(windows), 3)
             self.assertTrue(all(len(figure.axes[0].images) == 1 for figure in windows))
+        finally:
+            for figure in windows:
+                plt.close(figure)
+
+    def test_slice_windows_overlay_opaque_surface(self):
+        try:
+            import matplotlib
+        except ImportError:
+            self.skipTest("Matplotlib is an optional dependency")
+        matplotlib.use("Agg", force=True)
+        from matplotlib import pyplot as plt
+
+        flow = add_occulting_shape(
+            FlowGrid(
+                (-2, 2, -2, 2, -2, 2),
+                np.ones((8, 8, 8)),
+                np.ones((8, 8, 8)),
+                np.ones((8, 8, 8)),
+                np.ones((8, 8, 8)),
+            ),
+            "sphere",
+            (0.0, 0.0, 0.0),
+            1.2,
+        )
+        windows = create_slice_windows(flow, "density")
+        try:
+            self.assertEqual(len(windows), 3)
+            self.assertTrue(
+                all(len(figure.axes[0].collections) == 1 for figure in windows)
+            )
+            self.assertTrue(
+                all(
+                    figure.axes[0].get_legend().get_texts()[0].get_text()
+                    == "Opaque surface"
+                    for figure in windows
+                )
+            )
         finally:
             for figure in windows:
                 plt.close(figure)

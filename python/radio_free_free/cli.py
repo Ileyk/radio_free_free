@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from .flow import FIELD_NAMES, resample_vtk
+from .flow import PHYSICAL_FIELD_NAMES, resample_vtk
 from .wind import spherical_wind
 
 
@@ -52,9 +52,9 @@ def main() -> None:
         )
     else:
         fields = json.loads(args.fields)
-        required_fields = set(FIELD_NAMES)
+        required_fields = set(PHYSICAL_FIELD_NAMES)
         if (not isinstance(fields, dict) or not required_fields.issubset(fields)
-                or set(fields) - set(FIELD_NAMES)):
+                or set(fields) - set(PHYSICAL_FIELD_NAMES)):
             parser.error(
                 "--fields must map density, temperature, electron_per_baryon, "
                 "and ion_charge2_per_baryon"

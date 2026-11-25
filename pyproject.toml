@@ -15,6 +15,7 @@ visualization = ["matplotlib>=3.5"]
 
 [project.scripts]
 rff-flow = "radio_free_free.cli:main"
+rff-occult = "radio_free_free.occulter:main"
 rff-view = "radio_free_free.visualize:main"
 rff-plot = "radio_free_free.plot:main"
 

@@ -1,4 +1,5 @@
 [console_scripts]
 rff-flow = radio_free_free.cli:main
+rff-occult = radio_free_free.occulter:main
 rff-plot = radio_free_free.plot:main
 rff-view = radio_free_free.visualize:main

@@ -5,22 +5,26 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping, Tuple
+from typing import Callable, Mapping, Optional, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
 
 FloatArray = NDArray[np.float64]
 Bounds = Tuple[float, float, float, float, float, float]
-FLOW_MAGIC = b"RFFLOW2\0"
+FLOW_MAGIC = b"RFFLOW3\0"
+PREVIOUS_FLOW_MAGIC = b"RFFLOW2\0"
 LEGACY_FLOW_MAGIC = b"RFFLOW1\0"
-FIELD_NAMES = (
+PHYSICAL_FIELD_NAMES = (
     "density",
     "temperature",
     "electron_per_baryon",
     "ion_charge2_per_baryon",
 )
+FIELD_NAMES = PHYSICAL_FIELD_NAMES + ("occultation_mask",)
 _LEGACY_FIELD_COUNT = 5
+_PREVIOUS_FIELD_COUNT = 4
+_CURRENT_FIELD_COUNT = 5
 PROTON_MASS_G = 1.67262192369e-24
 
 
@@ -38,6 +42,7 @@ class FlowGrid:
     temperature: FloatArray
     electron_per_baryon: FloatArray
     ion_charge2_per_baryon: FloatArray
+    occultation_mask: Optional[FloatArray] = None
 
     def __post_init__(self) -> None:
         bounds = np.asarray(self.bounds, dtype=np.float64)
@@ -52,7 +57,7 @@ class FlowGrid:
         shape = density.shape
         if len(shape) != 3 or any(n < 1 for n in shape):
             raise ValueError("flow fields must be non-empty 3D arrays")
-        for name in FIELD_NAMES:
+        for name in PHYSICAL_FIELD_NAMES:
             values = np.asarray(getattr(self, name), dtype=np.float64)
             if values.shape != shape:
                 raise ValueError(f"{name} has shape {values.shape}, expected {shape}")
@@ -60,12 +65,24 @@ class FlowGrid:
                 raise ValueError(f"{name} contains non-finite values")
             object.__setattr__(self, name, values)
         object.__setattr__(self, "density", density)
+        mask = (
+            np.zeros(shape, dtype=np.float64)
+            if self.occultation_mask is None
+            else np.asarray(self.occultation_mask, dtype=np.float64)
+        )
+        if mask.shape != shape:
+            raise ValueError(f"occultation_mask has shape {mask.shape}, expected {shape}")
+        if not np.all(np.isfinite(mask)) or np.any((mask < 0) | (mask > 1)):
+            raise ValueError("occultation_mask must contain values between zero and one")
+        object.__setattr__(self, "occultation_mask", mask)
 
         for name in ("density", "electron_per_baryon", "ion_charge2_per_baryon"):
             if np.any(getattr(self, name) < 0):
                 raise ValueError(f"{name} must be non-negative")
-        if np.any(self.temperature <= 0):
-            raise ValueError("temperature must be positive")
+        if np.any(self.temperature < 0):
+            raise ValueError("temperature must be non-negative")
+        if np.any((self.density > 0) & (self.temperature <= 0)):
+            raise ValueError("temperature must be positive where density is non-zero")
 
     @property
     def shape(self) -> Tuple[int, int, int]:
@@ -126,9 +143,14 @@ class FlowGrid:
         with Path(path).open("rb") as stream:
             magic = stream.read(8)
             if magic == FLOW_MAGIC:
-                field_count = len(FIELD_NAMES)
+                field_count = _CURRENT_FIELD_COUNT
+                has_occultation_mask = True
+            elif magic == PREVIOUS_FLOW_MAGIC:
+                field_count = _PREVIOUS_FIELD_COUNT
+                has_occultation_mask = False
             elif magic == LEGACY_FLOW_MAGIC:
                 field_count = _LEGACY_FIELD_COUNT
+                has_occultation_mask = False
             else:
                 raise ValueError("not a radio_free_free flow file")
             dims_raw = stream.read(12)
@@ -142,8 +164,15 @@ class FlowGrid:
         if len(payload) != expected:
             raise ValueError(f"flow payload has {len(payload)} bytes; expected {expected}")
         values = np.frombuffer(payload, dtype="<f8").reshape((*shape, field_count))
-        values = values[..., : len(FIELD_NAMES)]
-        return cls(bounds, *(values[..., i].copy() for i in range(len(FIELD_NAMES))))
+        physical_fields = [
+            values[..., i].copy() for i in range(len(PHYSICAL_FIELD_NAMES))
+        ]
+        mask = (
+            values[..., len(PHYSICAL_FIELD_NAMES)].copy()
+            if has_occultation_mask
+            else None
+        )
+        return cls(bounds, *physical_fields, occultation_mask=mask)
 
 
 def resample_vtk(
@@ -172,10 +201,10 @@ def resample_vtk(
     except ImportError as error:
         raise ImportError("VTK resampling requires the 'vtk' optional dependencies") from error
 
-    missing = set(FIELD_NAMES) - set(field_names)
+    missing = set(PHYSICAL_FIELD_NAMES) - set(field_names)
     if missing:
         raise ValueError(f"field_names is missing mappings for {sorted(missing)}")
-    unknown = set(field_names) - set(FIELD_NAMES)
+    unknown = set(field_names) - set(PHYSICAL_FIELD_NAMES)
     if unknown:
         raise ValueError(f"field_names has unknown keys: {sorted(unknown)}")
     if not np.isfinite(number_density_scale) or number_density_scale <= 0:
@@ -196,7 +225,7 @@ def resample_vtk(
     )
     sampled = {}
 
-    for canonical in FIELD_NAMES:
+    for canonical in PHYSICAL_FIELD_NAMES:
         source_name = field_names[canonical]
         if source_name in mesh.point_data:
             points = np.asarray(mesh.points, dtype=np.float64)
@@ -223,7 +252,7 @@ def resample_vtk(
         sampled["density"], number_density_scale, density_kind
     )
     sampled["temperature"] /= temperature_scale
-    return FlowGrid(bounds, *(sampled[name] for name in FIELD_NAMES))
+    return FlowGrid(bounds, *(sampled[name] for name in PHYSICAL_FIELD_NAMES))
 
 
 def _number_density_ratio(
