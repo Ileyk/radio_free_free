@@ -2,10 +2,12 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
 from radio_free_free import FlowGrid, spherical_wind
+from radio_free_free.cli import main as flow_main
 from radio_free_free.flow import (
     FLOW_MAGIC,
     LEGACY_FLOW_MAGIC,
@@ -54,6 +56,58 @@ class FlowGridTests(unittest.TestCase):
         np.testing.assert_array_equal(
             flow.occultation_mask, np.zeros_like(flow.density)
         )
+
+    def test_writes_vtk_structured_points_with_x_fastest_cell_data(self):
+        density = np.arange(8, dtype=float).reshape((2, 2, 2))
+        flow = FlowGrid(
+            (0, 2, 0, 4, 0, 6),
+            density,
+            np.ones_like(density),
+            np.ones_like(density),
+            np.ones_like(density),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "flow.vtk"
+            flow.write_vtk(path)
+            lines = path.read_text().splitlines()
+
+        self.assertIn("DATASET STRUCTURED_POINTS", lines)
+        self.assertIn("DIMENSIONS 3 3 3", lines)
+        self.assertIn("ORIGIN 0 0 0", lines)
+        self.assertIn("SPACING 1 2 3", lines)
+        self.assertIn("CELL_DATA 8", lines)
+        density_header = lines.index("SCALARS density double 1")
+        self.assertEqual(lines[density_header + 1], "LOOKUP_TABLE default")
+        vtk_density = np.asarray(
+            lines[density_header + 2 : density_header + 10], dtype=float
+        )
+        np.testing.assert_array_equal(
+            vtk_density, density.transpose(2, 1, 0).ravel()
+        )
+
+    def test_flow_cli_writes_rff_and_same_stem_vtk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "wind.rff"
+            with patch(
+                "sys.argv",
+                [
+                    "rff-flow",
+                    "wind",
+                    str(output),
+                    "--resolution",
+                    "4",
+                    "4",
+                    "4",
+                ],
+            ):
+                flow_main()
+
+            vtk_output = output.with_suffix(".vtk")
+            self.assertTrue(output.is_file())
+            self.assertTrue(vtk_output.is_file())
+            reread = FlowGrid.read(output)
+            self.assertEqual(reread.shape, (4, 4, 4))
+            self.assertIn("DATASET STRUCTURED_POINTS", vtk_output.read_text())
 
     def test_spherical_wind_has_expected_radial_profile_and_composition(self):
         flow = spherical_wind((20, 20, 20), inner_radius=0.2, outer_radius=2)

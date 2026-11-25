@@ -137,6 +137,40 @@ class FlowGrid:
             fields = np.stack([getattr(self, name) for name in FIELD_NAMES], axis=-1)
             stream.write(np.asarray(fields, dtype="<f8", order="C").tobytes(order="C"))
 
+    def write_vtk(self, path: str | Path) -> None:
+        """Write a legacy ASCII VTK structured-points file with cell data."""
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        nx, ny, nz = self.shape
+        dx, dy, dz = self.spacing
+        with target.open("w", encoding="ascii", newline="\n") as stream:
+            stream.write("# vtk DataFile Version 3.0\n")
+            stream.write("radio_free_free cell-centered flow; dimensionless units\n")
+            stream.write("ASCII\n")
+            stream.write("DATASET STRUCTURED_POINTS\n")
+            stream.write(f"DIMENSIONS {nx + 1} {ny + 1} {nz + 1}\n")
+            stream.write(
+                f"ORIGIN {self.bounds[0]:.17g} {self.bounds[2]:.17g} "
+                f"{self.bounds[4]:.17g}\n"
+            )
+            stream.write(f"SPACING {dx:.17g} {dy:.17g} {dz:.17g}\n")
+            stream.write(f"CELL_DATA {nx * ny * nz}\n")
+            for name in FIELD_NAMES:
+                stream.write(f"SCALARS {name} double 1\n")
+                stream.write("LOOKUP_TABLE default\n")
+                vtk_order = getattr(self, name).transpose(2, 1, 0).ravel()
+                np.savetxt(stream, vtk_order, fmt="%.17g")
+
+    def write_with_vtk(self, path: str | Path) -> Path:
+        """Write the binary flow file and a same-stem legacy ASCII VTK file."""
+        target = Path(path)
+        vtk_target = target.with_suffix(".vtk")
+        if target == vtk_target:
+            raise ValueError("flow output path must not use the .vtk suffix")
+        self.write(target)
+        self.write_vtk(vtk_target)
+        return vtk_target
+
     @classmethod
     def read(cls, path: str | Path) -> "FlowGrid":
         """Read a solver interchange grid, validating its header and payload."""

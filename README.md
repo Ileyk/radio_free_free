@@ -82,6 +82,23 @@ physical normalization. Version-1 files with a stored Gaunt factor and
 version-2 files without a mask remain readable; their absent mask is treated
 as fully transparent.
 
+The native `.rff` file is not a VTK dataset, so VisIt and ParaView cannot open
+it directly. Both `rff-flow` and `rff-occult` automatically write a same-stem
+legacy ASCII `.vtk` file alongside their `.rff` output. For example,
+`wind.rff` is accompanied by `wind.vtk`, and `occulted-wind.rff` by
+`occulted-wind.vtk`. For files created another way, export manually:
+
+```python
+from radio_free_free import FlowGrid
+
+flow = FlowGrid.read("wind.rff")
+flow.write_vtk("wind.vtk")
+```
+
+`write_vtk()` writes a uniform structured-points dataset with cell-centered
+scalar fields, including `occultation_mask`. Coordinates remain in the
+dimensionless `R0` units used by the flow.
+
 ## Add an opaque volume
 
 After creating a flow file, use `rff-occult` to add a solid sphere or finite
@@ -100,28 +117,6 @@ length, and `--axis` selects x, y, or z (default z). The mask is sampled at
 flow cell centers. Run `rff-transfer` with the resulting output file as its
 input to activate occultation. A ray crossing an opaque cell loses all
 background emission behind it, while foreground flow remains visible.
-Occulting volumes can also be inspected with `rff-view`: their slice boundary
-is drawn in cyan over the selected flow field, or select `--field
-occultation_mask` to view the mask itself.
-
-## Interactive flow viewer
-
-Install the optional Matplotlib dependency and open a resampled flow file:
-
-```sh
-python -m pip install -e '.[visualization]'
-rff-view occulted-wind.rff --x 0 --y 0 --z 0 --field density
-```
-
-The viewer opens three separate windows for YZ, XZ, and XY slices. Each window
-shows the slice nearest the requested `--x`, `--y`, or `--z` coordinate. Omit
-any coordinate to use the middle grid cell on that axis; coordinates outside
-the grid bounds are rejected. Use `--field` to choose `density`,
-`temperature`, `electron_per_baryon`, `ion_charge2_per_baryon`, or
-`occultation_mask`; all three windows show the chosen field with a consistent
-color scale. Occulting-surface intersections are overlaid in cyan.
-Coordinates are displayed in the flow grid's `R0` units. A graphical
-Matplotlib backend is required.
 
 ## Plot radio outputs
 

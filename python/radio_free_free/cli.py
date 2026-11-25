@@ -68,8 +68,9 @@ def main() -> None:
             temperature_scale=args.temperature0,
             density_kind=args.density_kind,
         )
-    flow.write(args.output)
+    vtk_output = flow.write_with_vtk(args.output)
     print(f"Wrote {args.output}: shape={flow.shape}, bounds={flow.bounds}")
+    print(f"Wrote {vtk_output}")
 
 
 if __name__ == "__main__":

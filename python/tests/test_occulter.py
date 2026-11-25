@@ -1,11 +1,12 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
 from radio_free_free import FlowGrid, spherical_wind
-from radio_free_free.occulter import add_occulting_shape
+from radio_free_free.occulter import add_occulting_shape, main as occult_main
 
 
 class OccultingShapeTests(unittest.TestCase):
@@ -48,6 +49,36 @@ class OccultingShapeTests(unittest.TestCase):
         np.testing.assert_array_equal(
             reread.occultation_mask, masked.occultation_mask
         )
+
+    def test_occult_cli_writes_rff_and_same_stem_vtk_with_mask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "wind.rff"
+            output = Path(directory) / "occulted-wind.rff"
+            self.flow.write(input_path)
+            with patch(
+                "sys.argv",
+                [
+                    "rff-occult",
+                    str(input_path),
+                    str(output),
+                    "--shape",
+                    "sphere",
+                    "--center",
+                    "0",
+                    "0",
+                    "0",
+                    "--radius",
+                    "0.5",
+                ],
+            ):
+                occult_main()
+
+            vtk_output = output.with_suffix(".vtk")
+            self.assertTrue(output.is_file())
+            self.assertTrue(vtk_output.is_file())
+            self.assertIn("SCALARS occultation_mask double 1", vtk_output.read_text())
+            reread = FlowGrid.read(output)
+            self.assertGreater(np.count_nonzero(reread.occultation_mask), 0)
 
     def test_rejects_invalid_shapes_and_dimensions(self):
         with self.assertRaisesRegex(ValueError, "cylinder height"):

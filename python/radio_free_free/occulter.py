@@ -111,11 +111,12 @@ def main() -> None:
         height=args.height,
         axis=args.axis,
     )
-    masked_flow.write(args.output)
+    vtk_output = masked_flow.write_with_vtk(args.output)
     print(
         f"Wrote {args.output}: shape={masked_flow.shape}, "
         f"occulted cells={int(np.count_nonzero(masked_flow.occultation_mask))}"
     )
+    print(f"Wrote {vtk_output}")
 
 
 if __name__ == "__main__":

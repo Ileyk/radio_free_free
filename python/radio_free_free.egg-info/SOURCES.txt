@@ -5,7 +5,6 @@ python/radio_free_free/cli.py
 python/radio_free_free/flow.py
 python/radio_free_free/occulter.py
 python/radio_free_free/plot.py
-python/radio_free_free/visualize.py
 python/radio_free_free/wind.py
 python/radio_free_free.egg-info/PKG-INFO
 python/radio_free_free.egg-info/SOURCES.txt
@@ -16,4 +15,3 @@ python/radio_free_free.egg-info/top_level.txt
 python/tests/test_flow.py
 python/tests/test_occulter.py
 python/tests/test_plot.py
-python/tests/test_visualize.py
