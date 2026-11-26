@@ -18,6 +18,18 @@ def main() -> None:
     wind.add_argument("--resolution", type=int, nargs=3, default=(96, 96, 96))
     wind.add_argument("--inner-radius", type=float, default=1.0)
     wind.add_argument("--outer-radius", type=float, default=10.0)
+    wind.add_argument(
+        "--ni_Zi2_per_baryon",
+        type=float,
+        default=1.0,
+        help="uniform sum(Z_i^2 n_i)/n_b abundance (default: 1)",
+    )
+    wind.add_argument(
+        "--eff_Z_i",
+        type=float,
+        default=1.0,
+        help="uniform effective ionic charge (default: 1)",
+    )
 
     vtk = commands.add_parser("vtk", help="resample a meshio-readable VTK dataset")
     vtk.add_argument("input")
@@ -49,6 +61,8 @@ def main() -> None:
             tuple(args.resolution),
             inner_radius=args.inner_radius,
             outer_radius=args.outer_radius,
+            ni_Zi2_per_baryon=args.ni_Zi2_per_baryon,
+            eff_Z_i=args.eff_Z_i,
         )
     else:
         fields = json.loads(args.fields)

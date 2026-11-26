@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 
 from radio_free_free.plot import (
+    FlowGridParameters,
     PhysicalScales,
     RadioImage,
     RadioSpectrum,
@@ -80,6 +81,8 @@ class RadioOutputPlotTests(unittest.TestCase):
                 "# n0_cm^-3: 1000000\n"
                 "# temperature0_k: 10000\n"
                 "# length0_cm: 69570000000\n"
+                "# flow_resolution: 4,5,6\n"
+                "# flow_bounds_r0: -2,2,-3,3,-4,4\n"
                 "frequency_hz,projected_intensity_area\n"
                 "1000000000,1e20\n"
                 "10000000000,2e20\n"
@@ -94,6 +97,8 @@ class RadioOutputPlotTests(unittest.TestCase):
         self.assertEqual(output.scales.number_density_cm3, 1e6)
         self.assertEqual(output.scales.temperature_k, 1e4)
         self.assertEqual(output.scales.length_solar_radii, 1.0)
+        self.assertEqual(output.flow_grid.resolution, (4, 5, 6))
+        self.assertEqual(output.flow_grid.box_dimensions, (4.0, 6.0, 8.0))
 
     def test_reads_legacy_xy_image_output(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -144,6 +149,7 @@ class RadioOutputPlotTests(unittest.TestCase):
             "erg s^-1 Hz^-1",
             np.asarray([1e20, 2e20]),
             PhysicalScales(1e6, 1e4, 1.5e13),
+            FlowGridParameters((32, 24, 16), (-10, 10, -8, 8, -6, 6)),
         )
         image_figure, image_slider = plot_radio_output(image, 100)
         spectrum_figure, spectrum_slider = plot_radio_output(spectrum, 100)
@@ -194,6 +200,9 @@ class RadioOutputPlotTests(unittest.TestCase):
             self.assertIn("n_0", scale_legend)
             self.assertIn("T_0", scale_legend)
             self.assertIn("R_\\odot", scale_legend)
+            self.assertIn("N = 32 \\times 24 \\times 16", scale_legend)
+            self.assertIn("\\mathrm{Box}", scale_legend)
+            self.assertIn("20 \\times 16 \\times 12", scale_legend)
             initial_flux = spectrum_figure.axes[0].lines[0].get_ydata().copy()
             spectrum_slider.set_val(spectrum_slider.valmax)
             np.testing.assert_allclose(

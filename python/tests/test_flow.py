@@ -98,6 +98,10 @@ class FlowGridTests(unittest.TestCase):
                     "4",
                     "4",
                     "4",
+                    "--ni_Zi2_per_baryon",
+                    "1",
+                    "--eff_Z_i",
+                    "2",
                 ],
             ):
                 flow_main()
@@ -108,6 +112,11 @@ class FlowGridTests(unittest.TestCase):
             reread = FlowGrid.read(output)
             self.assertEqual(reread.shape, (4, 4, 4))
             self.assertIn("DATASET STRUCTURED_POINTS", vtk_output.read_text())
+            in_domain = reread.temperature > 0
+            np.testing.assert_allclose(
+                reread.ion_charge2_per_baryon[in_domain], 1.0
+            )
+            np.testing.assert_allclose(reread.electron_per_baryon[in_domain], 0.5)
 
     def test_spherical_wind_has_expected_radial_profile_and_composition(self):
         flow = spherical_wind((20, 20, 20), inner_radius=0.2, outer_radius=2)
@@ -138,6 +147,25 @@ class FlowGridTests(unittest.TestCase):
         np.testing.assert_array_equal(
             flow.ion_charge2_per_baryon[inside_sphere], 1.0
         )
+
+    def test_spherical_wind_supports_uniform_effective_ion_composition(self):
+        flow = spherical_wind(
+            (20, 20, 20),
+            inner_radius=0.2,
+            outer_radius=2,
+            ni_Zi2_per_baryon=1.0,
+            eff_Z_i=2.0,
+        )
+        inside_domain = flow.temperature > 0
+        np.testing.assert_allclose(flow.ion_charge2_per_baryon[inside_domain], 1.0)
+        np.testing.assert_allclose(flow.electron_per_baryon[inside_domain], 0.5)
+        np.testing.assert_allclose(
+            flow.ion_charge2_per_baryon[inside_domain]
+            / flow.electron_per_baryon[inside_domain],
+            2.0,
+        )
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            spherical_wind(eff_Z_i=0.5)
 
     def test_rejects_inconsistent_fields(self):
         with self.assertRaises(ValueError):

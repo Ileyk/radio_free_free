@@ -30,6 +30,20 @@ class PhysicalScales:
 
 
 @dataclass(frozen=True)
+class FlowGridParameters:
+    resolution: Tuple[int, int, int]
+    bounds: Tuple[float, float, float, float, float, float]
+
+    @property
+    def box_dimensions(self) -> Tuple[float, float, float]:
+        return (
+            self.bounds[1] - self.bounds[0],
+            self.bounds[3] - self.bounds[2],
+            self.bounds[5] - self.bounds[4],
+        )
+
+
+@dataclass(frozen=True)
 class RadioImage:
     u: NDArray[np.float64]
     v: NDArray[np.float64]
@@ -40,6 +54,7 @@ class RadioImage:
     projected_pixel_area_cm2: Optional[float] = None
     axis_names: Tuple[str, str] = ("u", "v")
     scales: Optional[PhysicalScales] = None
+    flow_grid: Optional[FlowGridParameters] = None
 
 
 @dataclass(frozen=True)
@@ -49,6 +64,7 @@ class RadioSpectrum:
     units: str
     projected_intensity_area: Optional[NDArray[np.float64]] = None
     scales: Optional[PhysicalScales] = None
+    flow_grid: Optional[FlowGridParameters] = None
 
 
 RadioOutput = Union[RadioImage, RadioSpectrum]
@@ -105,6 +121,38 @@ def _read_physical_scales(metadata: Dict[str, str]) -> Optional[PhysicalScales]:
     return PhysicalScales(*values)
 
 
+def _read_flow_grid_parameters(
+    metadata: Dict[str, str],
+) -> Optional[FlowGridParameters]:
+    keys = ("flow_resolution", "flow_bounds_r0")
+    present = [key in metadata for key in keys]
+    if not any(present):
+        return None
+    if not all(present):
+        raise ValueError("CSV must provide both flow grid metadata values")
+    resolution_values = _float_vector(
+        metadata["flow_resolution"].split(","), "flow_resolution"
+    )
+    bounds_values = _float_vector(
+        metadata["flow_bounds_r0"].split(","), "flow_bounds_r0"
+    )
+    if (
+        resolution_values.size != 3
+        or np.any(resolution_values < 1)
+        or np.any(resolution_values != np.floor(resolution_values))
+    ):
+        raise ValueError("flow_resolution must contain three positive integers")
+    if bounds_values.size != 6 or not all(
+        bounds_values[2 * axis] < bounds_values[2 * axis + 1]
+        for axis in range(3)
+    ):
+        raise ValueError("flow_bounds_r0 must contain three increasing bound pairs")
+    return FlowGridParameters(
+        tuple(int(value) for value in resolution_values),
+        tuple(float(value) for value in bounds_values),
+    )
+
+
 def _read_linford_spectrum() -> Tuple[
     NDArray[np.float64], NDArray[np.float64]
 ]:
@@ -136,6 +184,7 @@ def read_radio_output(
     metadata, rows = _read_csv(path)
     header = rows[0]
     scales = _read_physical_scales(metadata)
+    flow_grid = _read_flow_grid_parameters(metadata)
 
     if mode == "auto":
         if header and header[0] in ("u_over_R0", "x_over_R0"):
@@ -203,6 +252,7 @@ def read_radio_output(
             pixel_area,
             axis_names,
             scales,
+            flow_grid,
         )
 
     if header not in (
@@ -229,12 +279,14 @@ def read_radio_output(
             metadata.get("projected intensity-area units", "erg s^-1 Hz^-1"),
             values,
             scales,
+            flow_grid,
         )
     return RadioSpectrum(
         frequencies,
         values,
         metadata.get("integrated flux density units", "Jy"),
         scales=scales,
+        flow_grid=flow_grid,
     )
 
 
@@ -268,8 +320,8 @@ def _add_distance_slider(figure: Any, distance_pc: float, callback: Any):
     slider = Slider(
         slider_axis,
         "log10(distance / pc)",
-        log_distance - 1.0,
-        log_distance + 1.0,
+        log_distance - 0.5,
+        log_distance + 0.5,
         valinit=log_distance,
         valstep=0.01,
     )
@@ -428,6 +480,16 @@ def plot_radio_output(
                 + rf"$T_0 = {scales.temperature_k:.3g}\,\mathrm{{K}}$" + "\n"
                 + rf"$R_0 = {scales.length_solar_radii:.3g}\,R_\odot$"
             )
+            if output.flow_grid is not None:
+                nx, ny, nz = output.flow_grid.resolution
+                lx, ly, lz = output.flow_grid.box_dimensions
+                legend += (
+                    "\n"
+                    + rf"$N = {nx} \times {ny} \times {nz}$"
+                    + "\n"
+                    + rf"$\mathrm{{Box}} = {lx:.3g} \times {ly:.3g} "
+                    + rf"\times {lz:.3g}\,R_0$"
+                )
             axis.text(
                 0.98,
                 0.02,
@@ -473,8 +535,8 @@ def main() -> None:
     parser.add_argument(
         "--distance-pc",
         type=float,
-        default=100.0,
-        help="initial slider distance in parsecs (default: 100)",
+        default=895.0,
+        help="initial slider distance in parsecs (default: 895)",
     )
     args = parser.parse_args()
 

@@ -637,7 +637,21 @@ Kokkos::View<double**> compute_image(const RaySampleView& samples,
   return image;
 }
 
+void write_flow_grid_metadata(std::ostream& out, const Grid& grid) {
+  out << "# flow_resolution: " << grid.nx << ',' << grid.ny << ',' << grid.nz
+      << '\n';
+  out << "# flow_bounds_r0: ";
+  for (std::size_t i = 0; i < grid.bounds.size(); ++i) {
+    if (i > 0) {
+      out << ',';
+    }
+    out << grid.bounds[i];
+  }
+  out << '\n';
+}
+
 void write_image(const std::string& path, const ViewGeometry& view,
+                 const Grid& grid,
                  const Kokkos::View<double**>& image,
                  const double frequency, const double pixel_area_cm2,
                  const Options& options) {
@@ -652,6 +666,7 @@ void write_image(const std::string& path, const ViewGeometry& view,
   out << "# n0_cm^-3: " << options.number_density_scale << '\n';
   out << "# temperature0_k: " << options.temperature_scale << '\n';
   out << "# length0_cm: " << options.length_scale_cm << '\n';
+  write_flow_grid_metadata(out, grid);
   out << "# line_of_sight: " << view.los.x << ',' << view.los.y << ','
       << view.los.z << '\n';
   out << "# image basis u: " << view.u.x << ',' << view.u.y << ',' << view.u.z
@@ -708,7 +723,8 @@ std::vector<double> spectrum_frequencies(const Options& options) {
 
 void write_spectrum(const std::string& path, const std::vector<double>& frequencies,
                     const std::vector<double>& projected_intensity_areas,
-                    const ViewGeometry& view, const Options& options) {
+                    const ViewGeometry& view, const Grid& grid,
+                    const Options& options) {
   std::ofstream out(path);
   if (!out) {
     throw std::runtime_error("cannot open output spectrum: " + path);
@@ -718,6 +734,7 @@ void write_spectrum(const std::string& path, const std::vector<double>& frequenc
   out << "# n0_cm^-3: " << options.number_density_scale << '\n';
   out << "# temperature0_k: " << options.temperature_scale << '\n';
   out << "# length0_cm: " << options.length_scale_cm << '\n';
+  write_flow_grid_metadata(out, grid);
   out << "# line_of_sight: " << view.los.x << ',' << view.los.y << ','
       << view.los.z << '\n';
   out << "frequency_hz,projected_intensity_area\n";
@@ -742,8 +759,8 @@ void run(const Options& options) {
         ray_samples, view, options.frequency, options.length_scale_cm);
     const double pixel_area_cm2 =
         view.du * view.dv * options.length_scale_cm * options.length_scale_cm;
-    write_image(options.output, view, image, options.frequency, pixel_area_cm2,
-                options);
+    write_image(options.output, view, grid, image, options.frequency,
+                pixel_area_cm2, options);
     const ImageStats stats =
         integrate_image(image, view, options.length_scale_cm);
     std::cout << std::setprecision(10)
@@ -767,7 +784,7 @@ void run(const Options& options) {
             .projected_intensity_area);
   }
   write_spectrum(options.output, frequencies, projected_intensity_areas, view,
-                 options);
+                 grid, options);
   std::cout << "Wrote " << frequencies.size() << " logarithmically spaced "
             << "spectrum samples to " << options.output << '\n';
 }

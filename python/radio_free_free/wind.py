@@ -14,6 +14,8 @@ def spherical_wind(
     *,
     inner_radius: float = 0.5,
     outer_radius: float = 10.0,
+    ni_Zi2_per_baryon: float = 1.0,
+    eff_Z_i: float = 1.0,
 ) -> FlowGrid:
     """Create a fully ionized, isothermal number-density proportional to r^-2 wind.
 
@@ -22,9 +24,15 @@ def spherical_wind(
     is vacuum to avoid the singularity at r=0 and represents the stellar
     interior. ``outer_radius`` defines a spherical cutoff inside the
     enclosing Cartesian grid; all fields are zero beyond that radius.
+    The uniform composition is specified by ``ni_Zi2_per_baryon`` and
+    ``eff_Z_i``; the electron abundance is derived from their ratio.
     """
     if not (0 < inner_radius < outer_radius):
         raise ValueError("require 0 < inner_radius < outer_radius")
+    if not np.isfinite(ni_Zi2_per_baryon) or ni_Zi2_per_baryon <= 0:
+        raise ValueError("ni_Zi2_per_baryon must be finite and positive")
+    if not np.isfinite(eff_Z_i) or eff_Z_i < 1:
+        raise ValueError("eff_Z_i must be finite and at least one")
     bounds = (
         -outer_radius, outer_radius,
         -outer_radius, outer_radius,
@@ -51,11 +59,16 @@ def spherical_wind(
             np.float64
         )
 
+    electron_per_baryon = ni_Zi2_per_baryon / eff_Z_i
     return FlowGrid.from_functions(
         bounds,
         resolution,
         density=wind_number_density,
         temperature=wind_field,
-        electron_per_baryon=wind_field,
-        ion_charge2_per_baryon=wind_field,
+        electron_per_baryon=lambda x, y, z: (
+            electron_per_baryon * wind_field(x, y, z)
+        ),
+        ion_charge2_per_baryon=lambda x, y, z: (
+            ni_Zi2_per_baryon * wind_field(x, y, z)
+        ),
     )

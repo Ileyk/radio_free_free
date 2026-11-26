@@ -38,6 +38,20 @@ rff-flow wind wind.rff --resolution 128 128 128 \
   --inner-radius 0.5 --outer-radius 10
 ```
 
+The uniform ion composition defaults to fully ionized hydrogen
+(`ni_Zi2_per_baryon = 1`, `eff_Z_i = 1`). Set the two
+values explicitly for another uniform composition; for example, a
+fully-ionized helium wind uses:
+
+```sh
+rff-flow wind helium-wind.rff --ni_Zi2_per_baryon 1 --eff_Z_i 2
+```
+
+`ni_Zi2_per_baryon` is the uniform `(sum_i Z_i^2 n_i) / n_b` abundance. The
+electron abundance is derived as `ni_Zi2_per_baryon / eff_Z_i`; both
+abundances are zero outside the spherical wind cutoff. The stored flow-field
+name remains `ion_charge2_per_baryon`.
+
 In this file, `R0` is the radial unit and `n0` is the number density at
 `r = R0`. `outer-radius` sets a spherical wind cutoff; the Cartesian grid
 extends to the enclosing cube, but density, temperature, and abundances are
@@ -206,8 +220,10 @@ integral in `erg s^-1 Hz^-1`. The viewing-angle options apply to both modes.
 flow no longer contains a Gaunt-factor field. Output CSV metadata stores
 `n0`, `T0`, and `R0` for spectrum scale
 annotation; frequency values remain in Hz in the file and are displayed in
-GHz. The CSV records `length0_cm` after converting the input solar radii to
-centimeters.
+GHz. Transfer CSV metadata also stores the flow-grid resolution and bounds
+in `R0` units; `rff-plot` displays the resolution and box dimensions in the
+spectrum annotation. The CSV records `length0_cm` after converting the input
+solar radii to centimeters.
 
 Build against a Kokkos installation configured with CMake:
 
