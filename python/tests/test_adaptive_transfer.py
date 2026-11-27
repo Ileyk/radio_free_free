@@ -138,6 +138,45 @@ class AdaptiveTransferTests(unittest.TestCase):
         self.assertTrue(np.all(near_values == 0))
         self.assertTrue(np.all(far_values < clear_values))
 
+    def test_early_termination_uses_accumulated_intensity(self):
+        shape = (1, 1, 2)
+        ones = np.ones(shape)
+        flow = FlowGrid((0, 1, 0, 1, -1, 1), ones, ones, ones, ones)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            for mode in ((), ("--adaptive-longitudinal",)):
+                reference, _ = self.run_transfer(
+                    flow,
+                    directory,
+                    f"reference-{len(mode)}",
+                    (
+                        "--n0",
+                        "1e6",
+                        "--length0",
+                        "2",
+                        *mode,
+                        "--relative-intensity-threshold",
+                        "1e-12",
+                    ),
+                )
+                early_stop, _ = self.run_transfer(
+                    flow,
+                    directory,
+                    f"early-stop-{len(mode)}",
+                    (
+                        "--n0",
+                        "1e6",
+                        "--length0",
+                        "2",
+                        *mode,
+                        "--relative-intensity-threshold",
+                        "0.99",
+                    ),
+                )
+
+                np.testing.assert_allclose(early_stop, reference, rtol=1e-12)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -236,21 +236,26 @@ emission already accumulated in the foreground.
 For each ray, the solver caches the maximum temperature in the still-unvisited
 samples. Since `B_nu(T)` increases with temperature, this gives an upper bound
 on their source function. The solver stops when the foreground-transmitted
-bound is less than the configured fraction of that remaining source-function
-bound. The default `--relative-intensity-threshold` is `1e-3`; the underscore
-form `--relative_intensity_threshold` is also accepted. The value must be
-greater than zero and less than one.
+upper bound on omitted intensity is less than the configured fraction of the
+intensity already accumulated in the foreground. The default
+`--relative-intensity-threshold` is `1e-3`; the underscore form
+`--relative_intensity_threshold` is also accepted. The value must be greater
+than zero and less than one.
 
 Adaptive longitudinal integration is opt-in with `--adaptive-longitudinal`.
-It starts from the ray's spatial intervals and refines them using midpoint
-versus two-half-step estimates for both the emitted source contribution and
-the absorbed fraction. It tests reference frequencies spaced by half a decade
-over the requested frequency range and accepts an interval only when both
-estimates meet `--integration-tolerance` at every reference frequency. The
-default tolerance is `1e-3`. Neighboring intervals are then merged only when
-their transfer operators agree within that tolerance; the compressed ray is
-checked against the refined reference ray at every reference frequency, and
-the reference representation is used if verification fails. Without
+It first locates the nearest opaque boundary from the observer and restricts
+integration to the visible part of each ray. A coarse pilot integration at
+each reference frequency sets a ray-level intensity scale and distributes an
+absolute error budget across the visible path. Refinement compares the coarse
+affine transfer operator with the composition of its two half-step operators,
+accounting for emission and transmission errors; relative checks are applied
+only when the corresponding contribution is significant relative to its local
+budget. When an interval passes, its two half-steps are retained. Reference
+frequencies are spaced by half a decade over the requested frequency range.
+The default tolerance is `1e-3`. Neighboring intervals are then merged only
+when their transfer operators agree within that tolerance; the compressed ray
+is checked against the refined reference ray at every reference frequency,
+and the reference representation is used if verification fails. Without
 `--adaptive-longitudinal`, the existing fixed spatial sampling is used.
 `--integration-tolerance` is only valid when adaptive integration is enabled.
 Reference frequencies include both requested band endpoints. Adaptive

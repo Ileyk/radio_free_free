@@ -160,6 +160,12 @@ struct SegmentOperator {
   double source_contribution = 0.0;
 };
 
+struct AdaptiveContext {
+  double ray_intensity = 0.0;
+  double incoming_intensity = 0.0;
+  double foreground_transmission = 1.0;
+};
+
 struct AdaptiveRaySamples {
   AdaptiveSegmentView segments;
   RayOffsetView offsets;
@@ -559,6 +565,45 @@ FlowSample sample_flow(const FieldViewType& fields, const Grid& grid,
           false};
 }
 
+template <typename Sampler>
+bool clip_to_nearest_opaque_boundary(const double clipped_min,
+                                     const double clipped_max,
+                                     const double base_step,
+                                     Sampler&& sample_at,
+                                     double& visible_min) {
+  const std::size_t scan_count =
+      samples_for_span(clipped_max - clipped_min, base_step * 0.5);
+  const double scan_step = (clipped_max - clipped_min) / scan_count;
+  double transparent_s = clipped_max;
+  if (sample_at(transparent_s).opaque) {
+    return false;
+  }
+  for (std::size_t i = 1; i <= scan_count; ++i) {
+    const double sample_s =
+        i == scan_count ? clipped_min : clipped_max - i * scan_step;
+    if (sample_at(sample_s).opaque) {
+      double opaque_s = sample_s;
+      double clear_s = transparent_s;
+      for (int iteration = 0; iteration < 64; ++iteration) {
+        const double middle = opaque_s + (clear_s - opaque_s) * 0.5;
+        if (!(middle > opaque_s && middle < clear_s)) {
+          break;
+        }
+        if (sample_at(middle).opaque) {
+          opaque_s = middle;
+        } else {
+          clear_s = middle;
+        }
+      }
+      visible_min = clear_s;
+      return visible_min < clipped_max;
+    }
+    transparent_s = sample_s;
+  }
+  visible_min = clipped_min;
+  return true;
+}
+
 SegmentOperator segment_operator(const FlowSample& sample,
                                  const double frequency,
                                  const double length_cm) {
@@ -594,49 +639,134 @@ double relative_difference(const double first, const double second) {
   return std::abs(first - second) / scale;
 }
 
-bool same_opacity(const FlowSample& center, const FlowSample& left,
-                  const FlowSample& right) {
-  return center.opaque == left.opaque && center.opaque == right.opaque;
+std::vector<std::vector<AdaptiveContext>> build_pilot_contexts(
+    const std::vector<FlowSample>& samples,
+    const std::vector<double>& frequencies, const double interval_length_cm) {
+  std::vector<std::vector<AdaptiveContext>> contexts(
+      samples.size(), std::vector<AdaptiveContext>(frequencies.size()));
+  for (std::size_t frequency_index = 0;
+       frequency_index < frequencies.size(); ++frequency_index) {
+    const double frequency = frequencies[frequency_index];
+    std::vector<SegmentOperator> operations;
+    operations.reserve(samples.size());
+    double pilot_intensity = 0.0;
+    for (std::size_t i = 0; i < samples.size(); ++i) {
+      contexts[i][frequency_index].incoming_intensity = pilot_intensity;
+      const SegmentOperator operation =
+          segment_operator(samples[i], frequency, interval_length_cm);
+      operations.push_back(operation);
+      pilot_intensity =
+          operation.transmission * pilot_intensity +
+          operation.source_contribution;
+    }
+    double foreground_transmission = 1.0;
+    for (std::size_t i = samples.size(); i > 0; --i) {
+      AdaptiveContext& context = contexts[i - 1][frequency_index];
+      context.ray_intensity = pilot_intensity;
+      context.foreground_transmission = foreground_transmission;
+      foreground_transmission *= operations[i - 1].transmission;
+    }
+  }
+  return contexts;
 }
 
-bool refinement_criteria_pass(const FlowSample& center,
-                              const FlowSample& left,
-                              const FlowSample& right,
-                              const double interval_length,
-                              const double length_scale_cm,
-                              const std::vector<double>& frequencies,
-                              const double tolerance) {
-  if (!same_opacity(center, left, right)) {
-    return false;
+std::vector<std::vector<AdaptiveContext>> build_segment_pilot_contexts(
+    const std::vector<AdaptiveSegment>& segments,
+    const std::vector<double>& frequencies, const double length_scale_cm) {
+  std::vector<std::vector<AdaptiveContext>> contexts(
+      segments.size(), std::vector<AdaptiveContext>(frequencies.size()));
+  for (std::size_t frequency_index = 0;
+       frequency_index < frequencies.size(); ++frequency_index) {
+    const double frequency = frequencies[frequency_index];
+    std::vector<SegmentOperator> operations;
+    operations.reserve(segments.size());
+    double pilot_intensity = 0.0;
+    for (std::size_t i = 0; i < segments.size(); ++i) {
+      contexts[i][frequency_index].incoming_intensity = pilot_intensity;
+      const SegmentOperator operation = segment_operator(
+          segments[i].sample, frequency,
+          (segments[i].upper - segments[i].lower) * length_scale_cm);
+      operations.push_back(operation);
+      pilot_intensity =
+          operation.transmission * pilot_intensity +
+          operation.source_contribution;
+    }
+    double foreground_transmission = 1.0;
+    for (std::size_t i = segments.size(); i > 0; --i) {
+      AdaptiveContext& context = contexts[i - 1][frequency_index];
+      context.ray_intensity = pilot_intensity;
+      context.foreground_transmission = foreground_transmission;
+      foreground_transmission *= operations[i - 1].transmission;
+    }
   }
-  if (center.opaque) {
-    return true;
-  }
-  for (const double frequency : frequencies) {
+  return contexts;
+}
+
+bool refinement_criteria_pass(
+    const FlowSample& center, const FlowSample& left,
+    const FlowSample& right, const double interval_length,
+    const double total_ray_length_cm, const double length_scale_cm,
+    const std::vector<double>& frequencies,
+    const std::vector<AdaptiveContext>& contexts, const double tolerance,
+    std::vector<SegmentOperator>& left_operations,
+    std::vector<SegmentOperator>& right_operations) {
+  bool passes = true;
+  left_operations.clear();
+  right_operations.clear();
+  left_operations.reserve(frequencies.size());
+  right_operations.reserve(frequencies.size());
+  const double half_length_cm = interval_length * length_scale_cm * 0.5;
+  const double interval_fraction =
+      interval_length * length_scale_cm / total_ray_length_cm;
+  for (std::size_t i = 0; i < frequencies.size(); ++i) {
+    const double frequency = frequencies[i];
     const SegmentOperator coarse =
         segment_operator(center, frequency,
                          interval_length * length_scale_cm);
     const SegmentOperator left_half =
-        segment_operator(left, frequency,
-                         interval_length * length_scale_cm * 0.5);
+        segment_operator(left, frequency, half_length_cm);
     const SegmentOperator right_half =
-        segment_operator(right, frequency,
-                         interval_length * length_scale_cm * 0.5);
-    const double fine_absorption =
-        one_minus_exp_negative(left_half.optical_depth +
-                               right_half.optical_depth);
+        segment_operator(right, frequency, half_length_cm);
+    left_operations.push_back(left_half);
+    right_operations.push_back(right_half);
+
+    const double fine_transmission =
+        right_half.transmission * left_half.transmission;
     const double fine_source =
         right_half.transmission * left_half.source_contribution +
         right_half.source_contribution;
-    if (relative_difference(
-            one_minus_exp_negative(coarse.optical_depth), fine_absorption) >
-            tolerance ||
+    const AdaptiveContext& context = contexts[i];
+    const double local_error =
+        context.foreground_transmission *
+        (std::abs(coarse.source_contribution - fine_source) +
+         std::abs(coarse.transmission - fine_transmission) *
+             std::abs(context.incoming_intensity));
+    const double local_budget =
+        tolerance * context.ray_intensity * interval_fraction;
+    if (local_error > local_budget) {
+      passes = false;
+    }
+
+    const double emission_scale =
+        context.foreground_transmission *
+        std::max(std::abs(coarse.source_contribution), std::abs(fine_source));
+    if (emission_scale > local_budget &&
         relative_difference(coarse.source_contribution, fine_source) >
             tolerance) {
-      return false;
+      passes = false;
+    }
+    const double transmission_scale =
+        context.foreground_transmission *
+        std::abs(context.incoming_intensity) *
+        std::max(std::abs(coarse.transmission),
+                 std::abs(fine_transmission));
+    if (transmission_scale > local_budget &&
+        relative_difference(coarse.transmission, fine_transmission) >
+            tolerance) {
+      passes = false;
     }
   }
-  return true;
+  return passes;
 }
 
 void validate_and_copy_fields(const Grid& grid, FieldView* fields) {
@@ -815,75 +945,76 @@ std::vector<AdaptiveSegment> refine_reference_ray(
   std::vector<AdaptiveSegment> segments;
   const std::size_t interval_count = samples_for_span(s_max - s_min, base_step);
   const double interval_step = (s_max - s_min) / interval_count;
+  const double ray_length_cm = (s_max - s_min) * length_scale_cm;
+  std::vector<FlowSample> pilot_samples;
+  pilot_samples.reserve(interval_count);
+  for (std::size_t i = 0; i < interval_count; ++i) {
+    const double midpoint =
+        s_min + (i + 0.5) * interval_step;
+    const FlowSample sample = sample_at(midpoint);
+    if (sample.opaque) {
+      throw std::runtime_error(
+          "visible adaptive ray still intersects an opaque region");
+    }
+    pilot_samples.push_back(sample);
+  }
+  const std::vector<std::vector<AdaptiveContext>> pilot_contexts =
+      build_pilot_contexts(pilot_samples, frequencies,
+                           interval_step * length_scale_cm);
+
+  auto append_segment = [&](const double lower, const double upper,
+                            const FlowSample& sample) {
+    if (segments.size() >= kMaximumAdaptiveSegmentsPerRay) {
+      throw std::runtime_error(
+          "adaptive longitudinal ray exceeds the segment limit");
+    }
+    segments.push_back({lower, upper, sample});
+  };
   auto refine = [&](auto&& self, const double lower, const double upper,
-                    const int depth) -> void {
+                    const int depth,
+                    const std::vector<AdaptiveContext>& contexts) -> void {
     const double middle = lower + (upper - lower) * 0.5;
     const FlowSample center_sample = sample_at(middle);
     const double left_middle = lower + (middle - lower) * 0.5;
     const double right_middle = middle + (upper - middle) * 0.5;
-    const FlowSample lower_sample = sample_at(lower);
     const FlowSample left_sample = sample_at(left_middle);
     const FlowSample right_sample = sample_at(right_middle);
-    const FlowSample upper_sample = sample_at(upper);
-    const bool opacity_consistent =
-        same_opacity(center_sample, left_sample, right_sample);
-    if (!opacity_consistent) {
-      const std::array<double, 5> positions{{
-          lower, left_middle, middle, right_middle, upper}};
-      const std::array<FlowSample, 5> samples{{
-          lower_sample, left_sample, center_sample, right_sample,
-          upper_sample}};
-      std::vector<double> boundaries{lower};
-      for (std::size_t i = 0; i + 1 < positions.size(); ++i) {
-        if (samples[i].opaque == samples[i + 1].opaque) {
-          continue;
-        }
-        double bracket_min = positions[i];
-        double bracket_max = positions[i + 1];
-        const bool lower_is_opaque = samples[i].opaque;
-        for (int iteration = 0; iteration < 64; ++iteration) {
-          const double bracket_middle =
-              bracket_min + (bracket_max - bracket_min) * 0.5;
-          if (!(bracket_middle > bracket_min &&
-                bracket_middle < bracket_max)) {
-            break;
-          }
-          if (sample_at(bracket_middle).opaque == lower_is_opaque) {
-            bracket_min = bracket_middle;
-          } else {
-            bracket_max = bracket_middle;
-          }
-        }
-        const double boundary =
-            bracket_min + (bracket_max - bracket_min) * 0.5;
-        if (boundary > boundaries.back() && boundary < upper) {
-          boundaries.push_back(boundary);
-        }
-      }
-      boundaries.push_back(upper);
-      for (std::size_t i = 0; i + 1 < boundaries.size(); ++i) {
-        if (boundaries[i + 1] > boundaries[i]) {
-          self(self, boundaries[i], boundaries[i + 1], depth + 1);
-        }
-      }
-      return;
+    if (center_sample.opaque || left_sample.opaque || right_sample.opaque) {
+      throw std::runtime_error(
+          "visible adaptive ray still intersects an opaque region");
     }
-    if (refinement_criteria_pass(center_sample, left_sample, right_sample,
-                                 upper - lower, length_scale_cm, frequencies,
-                                 tolerance)) {
-      if (segments.size() >= kMaximumAdaptiveSegmentsPerRay) {
-        throw std::runtime_error(
-            "adaptive longitudinal ray exceeds the segment limit");
-      }
-      segments.push_back({lower, upper, center_sample});
+    std::vector<SegmentOperator> left_operations;
+    std::vector<SegmentOperator> right_operations;
+    const bool passes = refinement_criteria_pass(
+        center_sample, left_sample, right_sample, upper - lower,
+        ray_length_cm, length_scale_cm, frequencies, contexts, tolerance,
+        left_operations, right_operations);
+    if (passes) {
+      append_segment(lower, middle, left_sample);
+      append_segment(middle, upper, right_sample);
       return;
     }
     if (depth >= kMaximumAdaptiveDepth || !(middle > lower && middle < upper)) {
       throw std::runtime_error(
           "adaptive longitudinal refinement did not converge");
     }
-    self(self, lower, middle, depth + 1);
-    self(self, middle, upper, depth + 1);
+    std::vector<AdaptiveContext> left_contexts(contexts.size());
+    std::vector<AdaptiveContext> right_contexts(contexts.size());
+    for (std::size_t i = 0; i < contexts.size(); ++i) {
+      left_contexts[i] = {
+          contexts[i].ray_intensity,
+          contexts[i].incoming_intensity,
+          contexts[i].foreground_transmission *
+              right_operations[i].transmission};
+      right_contexts[i] = {
+          contexts[i].ray_intensity,
+          left_operations[i].transmission *
+                  contexts[i].incoming_intensity +
+              left_operations[i].source_contribution,
+          contexts[i].foreground_transmission};
+    }
+    self(self, lower, middle, depth + 1, left_contexts);
+    self(self, middle, upper, depth + 1, right_contexts);
   };
 
   for (std::size_t i = 0; i < interval_count; ++i) {
@@ -891,21 +1022,7 @@ std::vector<AdaptiveSegment> refine_reference_ray(
     const double upper = i + 1 == interval_count
                              ? s_max
                              : s_min + (i + 1) * interval_step;
-    refine(refine, lower, upper, 0);
-  }
-  return segments;
-}
-
-std::vector<AdaptiveSegment> visible_ray_segments(
-    std::vector<AdaptiveSegment> segments) {
-  std::size_t nearest_opaque = segments.size();
-  for (std::size_t i = 0; i < segments.size(); ++i) {
-    if (segments[i].sample.opaque) {
-      nearest_opaque = i;
-    }
-  }
-  if (nearest_opaque < segments.size()) {
-    segments.erase(segments.begin(), segments.begin() + nearest_opaque);
+    refine(refine, lower, upper, 0, pilot_contexts[i]);
   }
   return segments;
 }
@@ -914,9 +1031,17 @@ bool merged_operator_matches(const std::vector<AdaptiveSegment>& reference,
                              const std::size_t begin, const std::size_t end,
                              const AdaptiveSegment& candidate,
                              const std::vector<double>& frequencies,
+                             const std::vector<std::vector<AdaptiveContext>>&
+                                 contexts,
+                             const double total_ray_length_cm,
                              const double length_scale_cm,
                              const double tolerance) {
-  for (const double frequency : frequencies) {
+  const double interval_fraction =
+      (reference[end - 1].upper - reference[begin].lower) *
+      length_scale_cm / total_ray_length_cm;
+  for (std::size_t frequency_index = 0;
+       frequency_index < frequencies.size(); ++frequency_index) {
+    const double frequency = frequencies[frequency_index];
     double reference_transmission = 1.0;
     double reference_source = 0.0;
     for (std::size_t i = begin; i < end; ++i) {
@@ -931,11 +1056,37 @@ bool merged_operator_matches(const std::vector<AdaptiveSegment>& reference,
     const SegmentOperator candidate_operation = segment_operator(
         candidate.sample, frequency,
         (candidate.upper - candidate.lower) * length_scale_cm);
-    if (relative_difference(reference_transmission,
-                            candidate_operation.transmission) > tolerance ||
-        relative_difference(reference_source,
-                            candidate_operation.source_contribution) >
-            tolerance) {
+    const AdaptiveContext& incoming =
+        contexts[begin][frequency_index];
+    const AdaptiveContext& outgoing =
+        contexts[end - 1][frequency_index];
+    const double local_budget =
+        tolerance * incoming.ray_intensity * interval_fraction;
+    const double local_error =
+        outgoing.foreground_transmission *
+        (std::abs(reference_source -
+                  candidate_operation.source_contribution) +
+         std::abs(reference_transmission -
+                  candidate_operation.transmission) *
+             std::abs(incoming.incoming_intensity));
+    const double emission_scale =
+        outgoing.foreground_transmission *
+        std::max(std::abs(reference_source),
+                 std::abs(candidate_operation.source_contribution));
+    const double transmission_scale =
+        outgoing.foreground_transmission *
+        std::abs(incoming.incoming_intensity) *
+        std::max(std::abs(reference_transmission),
+                 std::abs(candidate_operation.transmission));
+    if (local_error > local_budget ||
+        (emission_scale > local_budget &&
+         relative_difference(reference_source,
+                             candidate_operation.source_contribution) >
+             tolerance) ||
+        (transmission_scale > local_budget &&
+         relative_difference(reference_transmission,
+                             candidate_operation.transmission) >
+             tolerance)) {
       return false;
     }
   }
@@ -945,7 +1096,9 @@ bool merged_operator_matches(const std::vector<AdaptiveSegment>& reference,
 template <typename Sampler>
 std::vector<AdaptiveSegment> compress_ray_segments(
     const std::vector<AdaptiveSegment>& reference,
-    const std::vector<double>& frequencies, const double length_scale_cm,
+    const std::vector<double>& frequencies,
+    const std::vector<std::vector<AdaptiveContext>>& contexts,
+    const double total_ray_length_cm, const double length_scale_cm,
     const double tolerance, Sampler&& sample_at) {
   std::vector<AdaptiveSegment> compressed;
   std::size_t begin = 0;
@@ -969,7 +1122,9 @@ std::vector<AdaptiveSegment> compress_ray_segments(
           lower, upper, sample_at(lower + (upper - lower) * 0.5)};
       if (candidate.sample.opaque ||
           !merged_operator_matches(reference, begin, end, candidate,
-                                   frequencies, length_scale_cm, tolerance)) {
+                                   frequencies, contexts,
+                                   total_ray_length_cm, length_scale_cm,
+                                   tolerance)) {
         break;
       }
       accepted = candidate;
@@ -1069,39 +1224,60 @@ AdaptiveRaySamples build_adaptive_ray_samples(
         return sample_flow(fields, grid, options, origin_x + losx * s,
                            origin_y + losy * s, origin_z + losz * s);
       };
-      std::vector<AdaptiveSegment> reference = refine_reference_ray(
-          clipped_min, clipped_max, view.ds, frequencies,
-          options.length_scale_cm,
-          options.integration_tolerance, sample_at);
-      reference = visible_ray_segments(std::move(reference));
-      const std::vector<AdaptiveSegment> compressed = compress_ray_segments(
-          reference, frequencies, options.length_scale_cm,
-          options.integration_tolerance, sample_at);
-      bool compressed_is_accurate = true;
-      for (const double frequency : frequencies) {
-        const double reference_intensity = integrate_adaptive_ray(
-            reference, frequency, options.length_scale_cm);
-        const double compressed_intensity = integrate_adaptive_ray(
-            compressed, frequency, options.length_scale_cm);
-        if (relative_difference(reference_intensity, compressed_intensity) >
-            options.integration_tolerance) {
-          compressed_is_accurate = false;
-          break;
+      double visible_min = clipped_min;
+      const bool has_visible_material = clip_to_nearest_opaque_boundary(
+          clipped_min, clipped_max, view.ds, sample_at, visible_min);
+      if (has_visible_material) {
+        const std::vector<AdaptiveSegment> reference = refine_reference_ray(
+            visible_min, clipped_max, view.ds, frequencies,
+            options.length_scale_cm, options.integration_tolerance, sample_at);
+        const std::vector<std::vector<AdaptiveContext>> reference_contexts =
+            build_segment_pilot_contexts(reference, frequencies,
+                                         options.length_scale_cm);
+        const std::vector<AdaptiveSegment> compressed =
+            compress_ray_segments(
+                reference, frequencies, reference_contexts,
+                (clipped_max - visible_min) * options.length_scale_cm,
+                options.length_scale_cm,
+                options.integration_tolerance, sample_at);
+        bool compressed_is_accurate = true;
+        for (std::size_t frequency_index = 0;
+             frequency_index < frequencies.size(); ++frequency_index) {
+          const double frequency = frequencies[frequency_index];
+          const double reference_intensity = integrate_adaptive_ray(
+              reference, frequency, options.length_scale_cm);
+          const double compressed_intensity = integrate_adaptive_ray(
+              compressed, frequency, options.length_scale_cm);
+          const double verification_budget =
+              options.integration_tolerance *
+              reference_contexts.front()[frequency_index].ray_intensity;
+          const double verification_scale =
+              std::max(std::abs(reference_intensity),
+                       std::abs(compressed_intensity));
+          if (std::abs(reference_intensity - compressed_intensity) >
+                  verification_budget ||
+              (verification_scale > verification_budget &&
+               relative_difference(reference_intensity,
+                                    compressed_intensity) >
+                   options.integration_tolerance)) {
+            compressed_is_accurate = false;
+            break;
+          }
         }
-      }
-      const std::vector<AdaptiveSegment>& selected =
-          compressed_is_accurate ? compressed : reference;
-      double maximum_remaining_temperature = 0.0;
-      for (const AdaptiveSegment& segment : selected) {
-        packed_segments.push_back(
-            {{segment.sample.temperature, segment.sample.emission_measure,
-              segment.sample.ionic_charge,
-              segment.upper - segment.lower,
-              segment.sample.opaque ? 1.0 : 0.0,
-              maximum_remaining_temperature}});
-        if (!segment.sample.opaque &&
-            segment.sample.temperature > maximum_remaining_temperature) {
-          maximum_remaining_temperature = segment.sample.temperature;
+        const std::vector<AdaptiveSegment>& selected =
+            compressed_is_accurate ? compressed : reference;
+        double maximum_remaining_temperature = 0.0;
+        for (const AdaptiveSegment& segment : selected) {
+          packed_segments.push_back(
+              {{segment.sample.temperature, segment.sample.emission_measure,
+                segment.sample.ionic_charge,
+                segment.upper - segment.lower,
+                segment.sample.opaque ? 1.0 : 0.0,
+                maximum_remaining_temperature}});
+          if (!segment.sample.opaque &&
+              segment.sample.temperature > maximum_remaining_temperature) {
+            maximum_remaining_temperature = segment.sample.temperature;
+          }
         }
       }
     }
@@ -1188,7 +1364,7 @@ Kokkos::View<double**> compute_image(const RaySampleView& samples,
               Kokkos::exp(-foreground_optical_depth) *
               remaining_source_bound;
           if (omitted_intensity_bound <
-              relative_intensity_threshold * remaining_source_bound) {
+              relative_intensity_threshold * intensity) {
             break;
           }
         }
@@ -1253,7 +1429,7 @@ Kokkos::View<double**> compute_adaptive_image(
               frequency, remaining_temperature_bound);
           if (Kokkos::exp(-foreground_optical_depth) *
                   remaining_source_bound <
-              relative_intensity_threshold * remaining_source_bound) {
+              relative_intensity_threshold * intensity) {
             break;
           }
         }

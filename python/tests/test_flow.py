@@ -134,19 +134,10 @@ class FlowGridTests(unittest.TestCase):
         )
         outside_sphere = grid_radius_squared > 2.0**2
         self.assertTrue(np.any(outside_sphere))
-        for field in (
-            flow.density,
-            flow.temperature,
-            flow.electron_per_baryon,
-            flow.ion_charge2_per_baryon,
-        ):
-            np.testing.assert_array_equal(field[outside_sphere], 0.0)
-        inside_sphere = ~outside_sphere
-        np.testing.assert_array_equal(flow.temperature[inside_sphere], 1.0)
-        np.testing.assert_array_equal(flow.electron_per_baryon[inside_sphere], 1.0)
-        np.testing.assert_array_equal(
-            flow.ion_charge2_per_baryon[inside_sphere], 1.0
-        )
+        np.testing.assert_array_equal(flow.density[outside_sphere], 0.0)
+        np.testing.assert_array_equal(flow.temperature, 1.0)
+        np.testing.assert_array_equal(flow.electron_per_baryon, 1.0)
+        np.testing.assert_array_equal(flow.ion_charge2_per_baryon, 1.0)
 
     def test_spherical_wind_supports_uniform_effective_ion_composition(self):
         flow = spherical_wind(
@@ -156,12 +147,10 @@ class FlowGridTests(unittest.TestCase):
             ni_Zi2_per_baryon=1.0,
             eff_Z_i=2.0,
         )
-        inside_domain = flow.temperature > 0
-        np.testing.assert_allclose(flow.ion_charge2_per_baryon[inside_domain], 1.0)
-        np.testing.assert_allclose(flow.electron_per_baryon[inside_domain], 0.5)
+        np.testing.assert_allclose(flow.ion_charge2_per_baryon, 1.0)
+        np.testing.assert_allclose(flow.electron_per_baryon, 0.5)
         np.testing.assert_allclose(
-            flow.ion_charge2_per_baryon[inside_domain]
-            / flow.electron_per_baryon[inside_domain],
+            flow.ion_charge2_per_baryon / flow.electron_per_baryon,
             2.0,
         )
         with self.assertRaisesRegex(ValueError, "at least one"):
