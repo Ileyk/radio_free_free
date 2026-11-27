@@ -4,7 +4,7 @@
 # compile CXX with /usr/bin/c++
 CXX_DEFINES = -DKOKKOS_DEPENDENCE
 
-CXX_INCLUDES = -isystem /opt/homebrew/include -isystem /opt/homebrew/opt/libomp/include
+CXX_INCLUDES = -isystem /opt/homebrew/include -isystem /opt/homebrew/opt/libomp/include -isystem /Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/include/python3.9
 
 CXX_FLAGSarm64 = -std=gnu++20 -arch arm64 -Wall -Wextra -Wpedantic -Xclang -fopenmp
 

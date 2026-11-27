@@ -1,10 +1,12 @@
 #include <Kokkos_Core.hpp>
+#include <Python.h>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -93,10 +95,15 @@ struct Options {
   double relative_intensity_threshold = 1.0e-3;
   double integration_tolerance = 1.0e-3;
   std::size_t frequency_count = 64;
+  std::size_t image_nu = 128;
+  std::size_t image_nv = 128;
+  std::size_t ray_samples = 128;
   double theta_deg = 0.0;
   double phi_deg = 0.0;
   bool adaptive_longitudinal = false;
   bool integration_tolerance_given = false;
+  bool image_resolution_given = false;
+  bool ray_samples_given = false;
 };
 
 struct Grid {
@@ -139,6 +146,53 @@ struct ViewGeometry {
   Vector3 u;
   Vector3 v;
   Vector3 los;
+};
+
+struct ImageGeometry {
+  std::size_t nx;
+  std::size_t ny;
+  double u_min;
+  double v_min;
+  double du;
+  double dv;
+  Vector3 u;
+  Vector3 v;
+  Vector3 los;
+};
+
+struct OpaqueObject {
+  enum class Shape { Sphere, Cylinder };
+  Shape shape;
+  Vector3 center;
+  double radius;
+  double height = 0.0;
+  Vector3 axis{};
+};
+
+struct AnalyticalModel {
+  std::string filename;
+  std::string module_name;
+  std::string coordinates;
+  std::array<double, 6> bounds;
+  std::vector<OpaqueObject> opaque_objects;
+  bool owns_interpreter = false;
+  PyObject* module = nullptr;
+  PyObject* density = nullptr;
+  PyObject* temperature = nullptr;
+  PyObject* electron_per_baryon = nullptr;
+  PyObject* ion_charge2_per_baryon = nullptr;
+  PyObject* numpy = nullptr;
+  PyObject* numpy_float64 = nullptr;
+
+  explicit AnalyticalModel(const std::string& path);
+  ~AnalyticalModel();
+  AnalyticalModel(const AnalyticalModel&) = delete;
+  AnalyticalModel& operator=(const AnalyticalModel&) = delete;
+  void evaluate(const std::vector<Vector3>& positions,
+                std::vector<double>& density_values,
+                std::vector<double>& temperature_values,
+                std::vector<double>& electron_values,
+                std::vector<double>& ion_charge2_values) const;
 };
 
 struct FlowSample {
@@ -240,7 +294,7 @@ struct OpaqueIntersectionDetected {
 };
 
 void usage(std::ostream& out) {
-  out << "Usage: rff-transfer --input flow.rff --output result.csv"
+  out << "Usage: rff-transfer --input flow.rff|model.py --output result.csv"
          " --n0 cm^-3 --temperature0 K --length0 R_sun\n"
          "  Spectrum: [--mode spectrum] --frequency-min-hz Hz"
          " --frequency-max-hz Hz [--frequency-count N]\n"
@@ -248,6 +302,8 @@ void usage(std::ostream& out) {
          " (alias --relative_intensity_threshold; default 1e-3)\n"
          "  Adaptive: [--adaptive-longitudinal]"
          " [--integration-tolerance (0,1)] (default 1e-3)\n"
+         "  Analytical Python input: [--image-resolution NU NV]"
+         " [--ray-samples NS]\n"
          "  Viewing:  [--view-theta-deg 0..180] [--view-phi-deg degrees]\n"
          "Theta is measured from +z; phi is measured from +x in the xy plane.\n";
 }
@@ -269,17 +325,25 @@ double parse_positive(const std::string& value, const std::string& name) {
   return parsed;
 }
 
-std::size_t parse_count(const std::string& value) {
+std::size_t parse_integer_at_least(const std::string& value,
+                                   const std::string& name,
+                                   const std::size_t minimum) {
   if (value.empty() || value.front() == '-') {
-    throw std::invalid_argument("--frequency-count must be an integer >= 2");
+    throw std::invalid_argument(name + " must be an integer >= " +
+                                std::to_string(minimum));
   }
   std::size_t consumed = 0;
   const auto parsed = std::stoull(value, &consumed);
   if (consumed != value.size() ||
-      parsed > std::numeric_limits<std::size_t>::max() || parsed < 2) {
-    throw std::invalid_argument("--frequency-count must be an integer >= 2");
+      parsed > std::numeric_limits<std::size_t>::max() || parsed < minimum) {
+    throw std::invalid_argument(name + " must be an integer >= " +
+                                std::to_string(minimum));
   }
   return static_cast<std::size_t>(parsed);
+}
+
+std::size_t parse_count(const std::string& value) {
+  return parse_integer_at_least(value, "--frequency-count", 2);
 }
 
 Options parse_options(int argc, char** argv) {
@@ -292,6 +356,18 @@ Options parse_options(int argc, char** argv) {
     }
     if (key == "--adaptive-longitudinal") {
       options.adaptive_longitudinal = true;
+      continue;
+    }
+    if (key == "--image-resolution") {
+      if (i + 2 >= argc) {
+        throw std::invalid_argument(
+            "--image-resolution requires NU and NV");
+      }
+      options.image_nu =
+          parse_integer_at_least(argv[++i], "--image-resolution NU", 1);
+      options.image_nv =
+          parse_integer_at_least(argv[++i], "--image-resolution NV", 1);
+      options.image_resolution_given = true;
       continue;
     }
     if (i + 1 >= argc) {
@@ -321,6 +397,10 @@ Options parse_options(int argc, char** argv) {
       options.frequency_max = parse_positive(value, key);
     } else if (key == "--frequency-count") {
       options.frequency_count = parse_count(value);
+    } else if (key == "--ray-samples") {
+      options.ray_samples =
+          parse_integer_at_least(value, "--ray-samples", 1);
+      options.ray_samples_given = true;
     } else if (key == "--relative-intensity-threshold" ||
                key == "--relative_intensity_threshold") {
       options.relative_intensity_threshold = parse_positive(value, key);
@@ -365,6 +445,20 @@ Options parse_options(int argc, char** argv) {
   if (options.integration_tolerance_given && !options.adaptive_longitudinal) {
     throw std::invalid_argument(
         "--integration-tolerance requires --adaptive-longitudinal");
+  }
+  if (options.image_nu >
+      std::numeric_limits<std::size_t>::max() / options.image_nv) {
+    throw std::invalid_argument("--image-resolution dimensions overflow");
+  }
+  if (std::filesystem::path(options.input).extension() == ".py" &&
+      options.adaptive_longitudinal) {
+    throw std::invalid_argument(
+        "--adaptive-longitudinal is not supported for analytical input");
+  }
+  if (std::filesystem::path(options.input).extension() != ".py" &&
+      (options.image_resolution_given || options.ray_samples_given)) {
+    throw std::invalid_argument(
+        "--image-resolution and --ray-samples require analytical Python input");
   }
   return options;
 }
@@ -469,6 +563,563 @@ Vector3 normalized(const Vector3& value) {
   return {value.x / magnitude, value.y / magnitude, value.z / magnitude};
 }
 
+class PyObjectRef {
+ public:
+  explicit PyObjectRef(PyObject* value = nullptr) : value_(value) {}
+  ~PyObjectRef() { Py_XDECREF(value_); }
+  PyObjectRef(const PyObjectRef&) = delete;
+  PyObjectRef& operator=(const PyObjectRef&) = delete;
+  PyObjectRef(PyObjectRef&& other) noexcept : value_(other.release()) {}
+  PyObjectRef& operator=(PyObjectRef&& other) noexcept {
+    if (this != &other) {
+      Py_XDECREF(value_);
+      value_ = other.release();
+    }
+    return *this;
+  }
+  PyObject* get() const { return value_; }
+  PyObject* release() {
+    PyObject* value = value_;
+    value_ = nullptr;
+    return value;
+  }
+
+ private:
+  PyObject* value_;
+};
+
+std::string python_error_message() {
+  if (!PyErr_Occurred()) {
+    return "unknown Python error";
+  }
+  PyObject* type = nullptr;
+  PyObject* value = nullptr;
+  PyObject* traceback = nullptr;
+  PyErr_Fetch(&type, &value, &traceback);
+  PyErr_NormalizeException(&type, &value, &traceback);
+  PyObjectRef type_ref(type);
+  PyObjectRef value_ref(value);
+  PyObjectRef traceback_ref(traceback);
+  PyObjectRef text(value != nullptr ? PyObject_Str(value) : nullptr);
+  const char* utf8 =
+      text.get() != nullptr ? PyUnicode_AsUTF8(text.get()) : nullptr;
+  const std::string message =
+      utf8 != nullptr ? utf8 : "failed to format Python exception";
+  if (utf8 == nullptr) {
+    PyErr_Clear();
+  }
+  return message;
+}
+
+[[noreturn]] void throw_python_error(const std::string& context) {
+  throw std::runtime_error(context + ": " + python_error_message());
+}
+
+PyObjectRef python_attribute(PyObject* object, const char* name,
+                             const std::string& context) {
+  PyObjectRef value(PyObject_GetAttrString(object, name));
+  if (value.get() == nullptr) {
+    throw_python_error(context);
+  }
+  return value;
+}
+
+std::vector<double> python_number_sequence(PyObject* object,
+                                           const std::size_t expected_size,
+                                           const std::string& description) {
+  PyObjectRef sequence(PySequence_Fast(
+      object, (description + " must be a sequence").c_str()));
+  if (sequence.get() == nullptr) {
+    throw_python_error(description);
+  }
+  const Py_ssize_t size = PySequence_Fast_GET_SIZE(sequence.get());
+  if (size != static_cast<Py_ssize_t>(expected_size)) {
+    throw std::runtime_error(description + " must contain " +
+                             std::to_string(expected_size) + " values");
+  }
+  std::vector<double> values;
+  values.reserve(expected_size);
+  PyObject** items = PySequence_Fast_ITEMS(sequence.get());
+  for (std::size_t i = 0; i < expected_size; ++i) {
+    const double value = PyFloat_AsDouble(items[i]);
+    if (PyErr_Occurred()) {
+      throw_python_error(description + " values must be numeric");
+    }
+    if (!std::isfinite(value)) {
+      throw std::runtime_error(description + " values must be finite");
+    }
+    values.push_back(value);
+  }
+  return values;
+}
+
+double python_dictionary_number(PyObject* dictionary, const char* key,
+                                const std::string& description) {
+  PyObject* value = PyDict_GetItemString(dictionary, key);
+  if (value == nullptr) {
+    throw std::runtime_error(description + " is missing '" + key + "'");
+  }
+  const double number = PyFloat_AsDouble(value);
+  if (PyErr_Occurred()) {
+    throw_python_error(description + " field '" + key + "' must be numeric");
+  }
+  if (!std::isfinite(number)) {
+    throw std::runtime_error(description + " field '" + key +
+                             "' must be finite");
+  }
+  return number;
+}
+
+std::vector<OpaqueObject> parse_opaque_objects(
+    PyObject* objects, const std::array<double, 6>& bounds) {
+  PyObjectRef sequence(
+      PySequence_Fast(objects, "opaque_objects must be a sequence"));
+  if (sequence.get() == nullptr) {
+    throw_python_error("opaque_objects");
+  }
+  std::vector<OpaqueObject> parsed;
+  const Py_ssize_t count = PySequence_Fast_GET_SIZE(sequence.get());
+  parsed.reserve(static_cast<std::size_t>(count));
+  PyObject** items = PySequence_Fast_ITEMS(sequence.get());
+  for (Py_ssize_t i = 0; i < count; ++i) {
+    PyObject* item = items[i];
+    if (!PyDict_Check(item)) {
+      throw std::runtime_error("each opaque_objects entry must be a dictionary");
+    }
+    const std::string description =
+        "opaque_objects[" + std::to_string(i) + "]";
+    PyObject* shape_value = PyDict_GetItemString(item, "shape");
+    if (shape_value == nullptr || !PyUnicode_Check(shape_value)) {
+      throw std::runtime_error(description + " requires a string 'shape'");
+    }
+    const char* shape_text = PyUnicode_AsUTF8(shape_value);
+    if (shape_text == nullptr) {
+      throw_python_error(description + " shape");
+    }
+    PyObject* center_value = PyDict_GetItemString(item, "center");
+    if (center_value == nullptr) {
+      throw std::runtime_error(description + " is missing 'center'");
+    }
+    const std::vector<double> center =
+        python_number_sequence(center_value, 3, description + " center");
+    OpaqueObject object{};
+    object.center = {center[0], center[1], center[2]};
+    object.radius = python_dictionary_number(item, "radius", description);
+    if (!(object.radius > 0.0)) {
+      throw std::runtime_error(description + " radius must be positive");
+    }
+    if (std::string(shape_text) == "sphere") {
+      object.shape = OpaqueObject::Shape::Sphere;
+    } else if (std::string(shape_text) == "cylinder") {
+      object.shape = OpaqueObject::Shape::Cylinder;
+      object.height =
+          python_dictionary_number(item, "height", description);
+      if (!(object.height > 0.0)) {
+        throw std::runtime_error(description + " height must be positive");
+      }
+      PyObject* axis_value = PyDict_GetItemString(item, "axis");
+      if (axis_value == nullptr) {
+        throw std::runtime_error(description + " is missing 'axis'");
+      }
+      const std::vector<double> axis =
+          python_number_sequence(axis_value, 3, description + " axis");
+      object.axis = normalized({axis[0], axis[1], axis[2]});
+    } else {
+      throw std::runtime_error(
+          description + " shape must be 'sphere' or 'cylinder'");
+    }
+
+    std::array<double, 3> half_extent{{object.radius, object.radius,
+                                       object.radius}};
+    if (object.shape == OpaqueObject::Shape::Cylinder) {
+      const double half_height = object.height * 0.5;
+      half_extent = {{
+          half_height * std::abs(object.axis.x) +
+              object.radius *
+                  std::sqrt(std::max(0.0, 1.0 - object.axis.x * object.axis.x)),
+          half_height * std::abs(object.axis.y) +
+              object.radius *
+                  std::sqrt(std::max(0.0, 1.0 - object.axis.y * object.axis.y)),
+          half_height * std::abs(object.axis.z) +
+              object.radius *
+                  std::sqrt(std::max(0.0, 1.0 - object.axis.z * object.axis.z)),
+      }};
+    }
+    const std::array<double, 3> center_coordinates{{
+        object.center.x, object.center.y, object.center.z}};
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+      if (center_coordinates[axis] - half_extent[axis] <
+              bounds[2 * axis] ||
+          center_coordinates[axis] + half_extent[axis] >
+              bounds[2 * axis + 1]) {
+        throw std::runtime_error(description +
+                                 " must lie inside the computational domain");
+      }
+    }
+    parsed.push_back(object);
+  }
+  return parsed;
+}
+
+PyObjectRef numpy_array_from_vector(PyObject* numpy, PyObject* float64,
+                                    const std::vector<double>& values) {
+  if (values.size() >
+      static_cast<std::size_t>(PY_SSIZE_T_MAX) / sizeof(double)) {
+    throw std::runtime_error("analytical ray batch is too large for Python");
+  }
+  const Py_ssize_t byte_count =
+      static_cast<Py_ssize_t>(values.size() * sizeof(double));
+  const char* data = values.empty()
+                         ? ""
+                         : reinterpret_cast<const char*>(values.data());
+  PyObjectRef bytes(PyBytes_FromStringAndSize(data, byte_count));
+  if (bytes.get() == nullptr) {
+    throw_python_error("creating analytical coordinate array");
+  }
+  PyObjectRef frombuffer(PyObject_GetAttrString(numpy, "frombuffer"));
+  if (frombuffer.get() == nullptr) {
+    throw_python_error("loading numpy.frombuffer");
+  }
+  PyObjectRef array(PyObject_CallFunctionObjArgs(
+      frombuffer.get(), bytes.get(), float64, nullptr));
+  if (array.get() == nullptr) {
+    throw_python_error("creating analytical NumPy array");
+  }
+  return array;
+}
+
+void evaluate_python_field(PyObject* numpy, PyObject* float64,
+                           PyObject* function, PyObject* arg1, PyObject* arg2,
+                           PyObject* arg3, const std::size_t count,
+                           const std::string& field_name,
+                           std::vector<double>& output) {
+  PyObjectRef value(PyObject_CallFunctionObjArgs(function, arg1, arg2, arg3,
+                                                 nullptr));
+  if (value.get() == nullptr) {
+    throw_python_error("evaluating " + field_name + "()");
+  }
+  PyObjectRef shape(PyTuple_New(1));
+  if (shape.get() == nullptr) {
+    throw_python_error("constructing analytical output shape");
+  }
+  PyObject* dimension = PyLong_FromSize_t(count);
+  if (dimension == nullptr) {
+    throw_python_error("constructing analytical output shape");
+  }
+  PyTuple_SET_ITEM(shape.get(), 0, dimension);
+
+  PyObjectRef broadcast_to(
+      python_attribute(numpy, "broadcast_to", "loading numpy.broadcast_to"));
+  PyObjectRef broadcast(PyObject_CallFunctionObjArgs(
+      broadcast_to.get(), value.get(), shape.get(), nullptr));
+  if (broadcast.get() == nullptr) {
+    throw_python_error(field_name + "() result is not broadcastable to the "
+                                   "ray batch shape");
+  }
+  PyObjectRef asarray(
+      python_attribute(numpy, "asarray", "loading numpy.asarray"));
+  PyObjectRef kwargs(PyDict_New());
+  if (kwargs.get() == nullptr ||
+      PyDict_SetItemString(kwargs.get(), "dtype", float64) != 0) {
+    throw_python_error("converting " + field_name + "() result");
+  }
+  PyObjectRef arguments(PyTuple_Pack(1, broadcast.get()));
+  if (arguments.get() == nullptr) {
+    throw_python_error("converting " + field_name + "() result");
+  }
+  PyObjectRef array(PyObject_Call(asarray.get(), arguments.get(), kwargs.get()));
+  if (array.get() == nullptr) {
+    throw_python_error("converting " + field_name + "() result to float64");
+  }
+  PyObjectRef contiguous_function(python_attribute(
+      numpy, "ascontiguousarray", "loading numpy.ascontiguousarray"));
+  PyObjectRef contiguous(PyObject_CallFunctionObjArgs(
+      contiguous_function.get(), array.get(), nullptr));
+  if (contiguous.get() == nullptr) {
+    throw_python_error("making " + field_name + "() result contiguous");
+  }
+
+  Py_buffer buffer{};
+  if (PyObject_GetBuffer(contiguous.get(), &buffer, PyBUF_CONTIG_RO) != 0) {
+    throw_python_error("reading " + field_name + "() result");
+  }
+  const std::size_t expected_bytes = count * sizeof(double);
+  if (buffer.len < 0 ||
+      static_cast<std::size_t>(buffer.len) != expected_bytes) {
+    PyBuffer_Release(&buffer);
+    throw std::runtime_error(field_name +
+                             "() returned an incompatible array shape");
+  }
+  output.resize(count);
+  if (expected_bytes > 0) {
+    std::memcpy(output.data(), buffer.buf, expected_bytes);
+  }
+  PyBuffer_Release(&buffer);
+}
+
+AnalyticalModel::AnalyticalModel(const std::string& path)
+    : filename(std::filesystem::absolute(path).lexically_normal().string()),
+      module_name("_rff_transfer_analytical_model") {
+  if (!std::filesystem::is_regular_file(filename)) {
+    throw std::runtime_error("cannot open analytical input file: " + filename);
+  }
+  if (!Py_IsInitialized()) {
+    Py_Initialize();
+    owns_interpreter = true;
+  }
+  try {
+    PyObjectRef import_util(PyImport_ImportModule("importlib.util"));
+    if (import_util.get() == nullptr) {
+      throw_python_error("importing importlib.util");
+    }
+    PyObjectRef spec_from_file_location(python_attribute(
+        import_util.get(), "spec_from_file_location",
+        "loading importlib.util.spec_from_file_location"));
+    PyObjectRef module_from_spec(python_attribute(
+        import_util.get(), "module_from_spec",
+        "loading importlib.util.module_from_spec"));
+    PyObjectRef module_name_object(
+        PyUnicode_FromString(module_name.c_str()));
+    PyObjectRef filename_object(PyUnicode_FromString(filename.c_str()));
+    PyObjectRef spec(PyObject_CallFunctionObjArgs(
+        spec_from_file_location.get(), module_name_object.get(),
+        filename_object.get(), nullptr));
+    if (spec.get() == nullptr) {
+      throw_python_error("loading analytical input file");
+    }
+    PyObjectRef loaded_module(
+        PyObject_CallFunctionObjArgs(module_from_spec.get(), spec.get(),
+                                     nullptr));
+    if (loaded_module.get() == nullptr) {
+      throw_python_error("creating analytical input module");
+    }
+    PyObjectRef system(PyImport_ImportModule("sys"));
+    PyObjectRef modules(PyObject_GetAttrString(system.get(), "modules"));
+    if (modules.get() == nullptr ||
+        PyDict_SetItemString(modules.get(), module_name.c_str(),
+                             loaded_module.get()) != 0) {
+      throw_python_error("registering analytical input module");
+    }
+    PyObjectRef system_path(PyObject_GetAttrString(system.get(), "path"));
+    PyObjectRef parent_path(PyUnicode_FromString(
+        std::filesystem::path(filename).parent_path().string().c_str()));
+    if (PyList_Insert(system_path.get(), 0, parent_path.get()) != 0) {
+      throw_python_error("adding analytical input directory to sys.path");
+    }
+    PyObjectRef loader(PyObject_GetAttrString(spec.get(), "loader"));
+    PyObjectRef execute(PyObject_GetAttrString(loader.get(), "exec_module"));
+    PyObjectRef executed(PyObject_CallFunctionObjArgs(
+        execute.get(), loaded_module.get(), nullptr));
+    if (executed.get() == nullptr) {
+      throw_python_error("executing analytical input file");
+    }
+
+    PyObjectRef bounds_object(
+        PyObject_GetAttrString(loaded_module.get(), "bounds"));
+    if (bounds_object.get() == nullptr) {
+      throw_python_error("analytical input must define 'bounds'");
+    }
+    const std::vector<double> parsed_bounds =
+        python_number_sequence(bounds_object.get(), 6, "bounds");
+    std::copy(parsed_bounds.begin(), parsed_bounds.end(), bounds.begin());
+    if (!(bounds[0] < bounds[1] && bounds[2] < bounds[3] &&
+          bounds[4] < bounds[5])) {
+      throw std::runtime_error(
+          "bounds must contain increasing Cartesian lower/upper pairs");
+    }
+
+    PyObjectRef coordinates_object(
+        PyObject_GetAttrString(loaded_module.get(), "coordinates"));
+    if (coordinates_object.get() == nullptr) {
+      throw_python_error("analytical input must define 'coordinates'");
+    }
+    if (!PyUnicode_Check(coordinates_object.get())) {
+      throw std::runtime_error(
+          "analytical input must define coordinates as a string");
+    }
+    const char* coordinate_name =
+        PyUnicode_AsUTF8(coordinates_object.get());
+    if (coordinate_name == nullptr) {
+      throw_python_error("reading analytical coordinates");
+    }
+    coordinates = coordinate_name;
+    if (coordinates != "spherical" && coordinates != "cylindrical" &&
+        coordinates != "cartesian") {
+      throw std::runtime_error(
+          "coordinates must be 'spherical', 'cylindrical', or 'cartesian'");
+    }
+
+    PyObjectRef objects_object(
+        PyObject_GetAttrString(loaded_module.get(), "opaque_objects"));
+    if (objects_object.get() == nullptr) {
+      if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
+        PyErr_Clear();
+        objects_object = PyObjectRef(PyList_New(0));
+      } else {
+        throw_python_error("reading analytical opaque_objects");
+      }
+    }
+    if (objects_object.get() == nullptr) {
+      throw_python_error("creating an empty opaque_objects list");
+    }
+    if (objects_object.get() != Py_None) {
+      opaque_objects = parse_opaque_objects(objects_object.get(), bounds);
+    }
+
+    PyObjectRef density_object(
+        PyObject_GetAttrString(loaded_module.get(), "density"));
+    PyObjectRef temperature_object(
+        PyObject_GetAttrString(loaded_module.get(), "temperature"));
+    PyObjectRef electron_object(
+        PyObject_GetAttrString(loaded_module.get(), "electron_per_baryon"));
+    PyObjectRef ion_charge2_object(
+        PyObject_GetAttrString(loaded_module.get(),
+                               "ion_charge2_per_baryon"));
+    const std::array<PyObject*, 4> functions{{
+        density_object.get(), temperature_object.get(), electron_object.get(),
+        ion_charge2_object.get()}};
+    const std::array<const char*, 4> function_names{{
+        "density", "temperature", "electron_per_baryon",
+        "ion_charge2_per_baryon"}};
+    for (std::size_t i = 0; i < functions.size(); ++i) {
+      if (functions[i] == nullptr) {
+        throw_python_error(std::string("analytical input must define ") +
+                           function_names[i] + "()");
+      }
+      if (!PyCallable_Check(functions[i])) {
+        throw std::runtime_error(std::string("analytical ") +
+                                 function_names[i] + " must be callable");
+      }
+    }
+
+    PyObjectRef numpy_module(PyImport_ImportModule("numpy"));
+    if (numpy_module.get() == nullptr) {
+      throw_python_error(
+          "importing NumPy; install NumPy for the embedded Python interpreter");
+    }
+    PyObjectRef float64_object(
+        PyObject_GetAttrString(numpy_module.get(), "float64"));
+    if (float64_object.get() == nullptr) {
+      throw_python_error("reading numpy.float64");
+    }
+
+    module = loaded_module.release();
+    density = density_object.release();
+    temperature = temperature_object.release();
+    electron_per_baryon = electron_object.release();
+    ion_charge2_per_baryon = ion_charge2_object.release();
+    numpy = numpy_module.release();
+    numpy_float64 = float64_object.release();
+  } catch (...) {
+    if (owns_interpreter && Py_IsInitialized()) {
+      PyObject* system = PyImport_ImportModule("sys");
+      if (system != nullptr) {
+        PyObject* modules = PyObject_GetAttrString(system, "modules");
+        if (modules != nullptr) {
+          if (PyDict_DelItemString(modules, module_name.c_str()) != 0) {
+            PyErr_Clear();
+          }
+          Py_DECREF(modules);
+        } else {
+          PyErr_Clear();
+        }
+        Py_DECREF(system);
+      } else {
+        PyErr_Clear();
+      }
+      Py_FinalizeEx();
+      owns_interpreter = false;
+    }
+    throw;
+  }
+}
+
+AnalyticalModel::~AnalyticalModel() {
+  if (Py_IsInitialized()) {
+    if (module != nullptr) {
+      PyObject* system = PyImport_ImportModule("sys");
+      if (system != nullptr) {
+        PyObject* modules = PyObject_GetAttrString(system, "modules");
+        if (modules != nullptr) {
+          if (PyDict_DelItemString(modules, module_name.c_str()) != 0) {
+            PyErr_Clear();
+          }
+          Py_DECREF(modules);
+        } else {
+          PyErr_Clear();
+        }
+        Py_DECREF(system);
+      } else {
+        PyErr_Clear();
+      }
+    }
+    Py_XDECREF(density);
+    Py_XDECREF(temperature);
+    Py_XDECREF(electron_per_baryon);
+    Py_XDECREF(ion_charge2_per_baryon);
+    Py_XDECREF(numpy_float64);
+    Py_XDECREF(numpy);
+    Py_XDECREF(module);
+    if (owns_interpreter) {
+      Py_FinalizeEx();
+    }
+  }
+}
+
+void AnalyticalModel::evaluate(
+    const std::vector<Vector3>& positions,
+    std::vector<double>& density_values,
+    std::vector<double>& temperature_values,
+    std::vector<double>& electron_values,
+    std::vector<double>& ion_charge2_values) const {
+  std::array<std::vector<double>, 3> coordinates_values;
+  for (auto& values : coordinates_values) {
+    values.reserve(positions.size());
+  }
+  for (const Vector3& position : positions) {
+    if (coordinates == "cartesian") {
+      coordinates_values[0].push_back(position.x);
+      coordinates_values[1].push_back(position.y);
+      coordinates_values[2].push_back(position.z);
+    } else {
+      const double cylindrical_radius = std::hypot(position.x, position.y);
+      double azimuth = std::atan2(position.y, position.x);
+      if (azimuth < 0.0) {
+        azimuth += 2.0 * kPi;
+      }
+      if (coordinates == "cylindrical") {
+        coordinates_values[0].push_back(cylindrical_radius);
+        coordinates_values[1].push_back(azimuth);
+        coordinates_values[2].push_back(position.z);
+      } else {
+        coordinates_values[0].push_back(
+            std::hypot(cylindrical_radius, position.z));
+        coordinates_values[1].push_back(
+            std::atan2(cylindrical_radius, position.z));
+        coordinates_values[2].push_back(azimuth);
+      }
+    }
+  }
+  PyObjectRef arg1(numpy_array_from_vector(
+      numpy, numpy_float64, coordinates_values[0]));
+  PyObjectRef arg2(numpy_array_from_vector(
+      numpy, numpy_float64, coordinates_values[1]));
+  PyObjectRef arg3(numpy_array_from_vector(
+      numpy, numpy_float64, coordinates_values[2]));
+  evaluate_python_field(numpy, numpy_float64, density, arg1.get(), arg2.get(),
+                        arg3.get(), positions.size(), "density",
+                        density_values);
+  evaluate_python_field(numpy, numpy_float64, temperature, arg1.get(),
+                        arg2.get(), arg3.get(), positions.size(),
+                        "temperature", temperature_values);
+  evaluate_python_field(numpy, numpy_float64, electron_per_baryon, arg1.get(),
+                        arg2.get(), arg3.get(), positions.size(),
+                        "electron_per_baryon", electron_values);
+  evaluate_python_field(numpy, numpy_float64, ion_charge2_per_baryon,
+                        arg1.get(), arg2.get(), arg3.get(), positions.size(),
+                        "ion_charge2_per_baryon", ion_charge2_values);
+}
+
 std::size_t samples_for_span(const double span, const double spacing) {
   const double count = std::ceil(span / spacing);
   if (!std::isfinite(count) || count < 1.0 ||
@@ -533,6 +1184,173 @@ ViewGeometry make_view_geometry(const Grid& grid, const Options& options) {
   return {nx, ny, nlos, u_min, v_min, s_min,
           (u_max - u_min) / nx, (v_max - v_min) / ny,
           (s_max - s_min) / nlos, u, v, los};
+}
+
+ImageGeometry make_image_geometry(const std::array<double, 6>& bounds,
+                                  const Options& options) {
+  const double theta = options.theta_deg * kPi / 180.0;
+  const double phi = options.phi_deg * kPi / 180.0;
+  const Vector3 los{std::sin(theta) * std::cos(phi),
+                    std::sin(theta) * std::sin(phi), std::cos(theta)};
+
+  Vector3 reference{1.0, 0.0, 0.0};
+  Vector3 horizontal{reference.x - dot(reference, los) * los.x,
+                     reference.y - dot(reference, los) * los.y,
+                     reference.z - dot(reference, los) * los.z};
+  if (dot(horizontal, horizontal) < 1.0e-24) {
+    reference = {0.0, 1.0, 0.0};
+    horizontal = {reference.x - dot(reference, los) * los.x,
+                  reference.y - dot(reference, los) * los.y,
+                  reference.z - dot(reference, los) * los.z};
+  }
+  const Vector3 u = normalized(horizontal);
+  const Vector3 v = normalized(cross(los, u));
+  double u_min = std::numeric_limits<double>::infinity();
+  double u_max = -u_min;
+  double v_min = u_min;
+  double v_max = -u_min;
+  for (int corner = 0; corner < 8; ++corner) {
+    const Vector3 point{
+        bounds[(corner & 1) ? 1 : 0],
+        bounds[(corner & 2) ? 3 : 2],
+        bounds[(corner & 4) ? 5 : 4],
+    };
+    const double projected_u = dot(point, u);
+    const double projected_v = dot(point, v);
+    u_min = std::min(u_min, projected_u);
+    u_max = std::max(u_max, projected_u);
+    v_min = std::min(v_min, projected_v);
+    v_max = std::max(v_max, projected_v);
+  }
+  return {options.image_nu, options.image_nv, u_min, v_min,
+          (u_max - u_min) / options.image_nu,
+          (v_max - v_min) / options.image_nv, u, v, los};
+}
+
+bool ray_domain_interval(const Vector3& origin, const Vector3& direction,
+                         const std::array<double, 6>& bounds,
+                         double& s_min, double& s_max) {
+  s_min = -std::numeric_limits<double>::infinity();
+  s_max = std::numeric_limits<double>::infinity();
+  const std::array<double, 3> point{{origin.x, origin.y, origin.z}};
+  const std::array<double, 3> vector{{direction.x, direction.y, direction.z}};
+  for (std::size_t axis = 0; axis < 3; ++axis) {
+    if (std::abs(vector[axis]) < 1.0e-14) {
+      if (point[axis] < bounds[2 * axis] ||
+          point[axis] > bounds[2 * axis + 1]) {
+        return false;
+      }
+      continue;
+    }
+    double first = (bounds[2 * axis] - point[axis]) / vector[axis];
+    double second = (bounds[2 * axis + 1] - point[axis]) / vector[axis];
+    if (first > second) {
+      std::swap(first, second);
+    }
+    s_min = std::max(s_min, first);
+    s_max = std::min(s_max, second);
+    if (s_min >= s_max) {
+      return false;
+    }
+  }
+  return std::isfinite(s_min) && std::isfinite(s_max) && s_min < s_max;
+}
+
+bool ray_object_interval(const Vector3& origin, const Vector3& direction,
+                         const OpaqueObject& object, double& s_min,
+                         double& s_max) {
+  const Vector3 offset{origin.x - object.center.x,
+                       origin.y - object.center.y,
+                       origin.z - object.center.z};
+  if (object.shape == OpaqueObject::Shape::Sphere) {
+    const double linear = dot(offset, direction);
+    const double constant = dot(offset, offset) - object.radius * object.radius;
+    const double discriminant = linear * linear - constant;
+    if (discriminant < 0.0) {
+      return false;
+    }
+    const double root = std::sqrt(std::max(0.0, discriminant));
+    s_min = -linear - root;
+    s_max = -linear + root;
+    return true;
+  }
+
+  const double axial_origin = dot(offset, object.axis);
+  const double axial_direction = dot(direction, object.axis);
+  const Vector3 radial_origin{
+      offset.x - axial_origin * object.axis.x,
+      offset.y - axial_origin * object.axis.y,
+      offset.z - axial_origin * object.axis.z};
+  const double radial_direction_projection =
+      dot(direction, object.axis);
+  const Vector3 radial_direction{
+      direction.x - radial_direction_projection * object.axis.x,
+      direction.y - radial_direction_projection * object.axis.y,
+      direction.z - radial_direction_projection * object.axis.z};
+  const double radial_a = dot(radial_direction, radial_direction);
+  const double radial_b = 2.0 * dot(radial_origin, radial_direction);
+  const double radial_c =
+      dot(radial_origin, radial_origin) - object.radius * object.radius;
+  double radial_min = -std::numeric_limits<double>::infinity();
+  double radial_max = std::numeric_limits<double>::infinity();
+  if (radial_a < 1.0e-28) {
+    if (radial_c > 0.0) {
+      return false;
+    }
+  } else {
+    const double discriminant =
+        radial_b * radial_b - 4.0 * radial_a * radial_c;
+    if (discriminant < 0.0) {
+      return false;
+    }
+    const double root = std::sqrt(std::max(0.0, discriminant));
+    radial_min = (-radial_b - root) / (2.0 * radial_a);
+    radial_max = (-radial_b + root) / (2.0 * radial_a);
+  }
+
+  double cap_min = -std::numeric_limits<double>::infinity();
+  double cap_max = std::numeric_limits<double>::infinity();
+  const double half_height = object.height * 0.5;
+  if (std::abs(axial_direction) < 1.0e-14) {
+    if (std::abs(axial_origin) > half_height) {
+      return false;
+    }
+  } else {
+    cap_min = (-half_height - axial_origin) / axial_direction;
+    cap_max = (half_height - axial_origin) / axial_direction;
+    if (cap_min > cap_max) {
+      std::swap(cap_min, cap_max);
+    }
+  }
+  s_min = std::max(radial_min, cap_min);
+  s_max = std::min(radial_max, cap_max);
+  return s_min <= s_max;
+}
+
+bool visible_ray_interval(const Vector3& origin, const Vector3& direction,
+                          const std::vector<OpaqueObject>& objects,
+                          const double domain_min, const double domain_max,
+                          double& visible_min) {
+  visible_min = domain_min;
+  const double boundary_epsilon =
+      1.0e-12 * std::max(1.0, std::abs(domain_max));
+  for (const OpaqueObject& object : objects) {
+    double object_min = 0.0;
+    double object_max = 0.0;
+    if (!ray_object_interval(origin, direction, object, object_min,
+                             object_max) ||
+        object_max < domain_min || object_min > domain_max) {
+      continue;
+    }
+    if (object_min <= domain_max + boundary_epsilon &&
+        object_max >= domain_max - boundary_epsilon) {
+      return false;
+    }
+    if (object_max > domain_min) {
+      visible_min = std::max(visible_min, object_max);
+    }
+  }
+  return visible_min < domain_max;
 }
 
 template <typename FieldViewType>
@@ -1571,6 +2389,152 @@ AdaptiveRaySamples build_adaptive_ray_samples(
   return {device_segments, device_offsets};
 }
 
+AdaptiveRaySamples build_analytical_ray_samples(
+    const AnalyticalModel& model, const ImageGeometry& image,
+    const Options& options,
+    const std::vector<std::array<double, 2>>& ray_coordinates) {
+  const std::size_t ray_count = ray_coordinates.size();
+  if (ray_count >
+      std::numeric_limits<std::size_t>::max() / options.ray_samples) {
+    throw std::runtime_error("analytical ray segment count overflows");
+  }
+  const std::size_t maximum_segments = ray_count * options.ray_samples;
+  std::vector<std::size_t> host_offsets(ray_count + 1, 0);
+  std::vector<Vector3> positions;
+  std::vector<double> segment_lengths;
+  positions.reserve(maximum_segments);
+  segment_lengths.reserve(maximum_segments);
+
+  for (std::size_t ray = 0; ray < ray_count; ++ray) {
+    const double u_coordinate = ray_coordinates[ray][0];
+    const double v_coordinate = ray_coordinates[ray][1];
+    const Vector3 origin{
+        image.u.x * u_coordinate + image.v.x * v_coordinate,
+        image.u.y * u_coordinate + image.v.y * v_coordinate,
+        image.u.z * u_coordinate + image.v.z * v_coordinate};
+    double domain_min = 0.0;
+    double domain_max = 0.0;
+    if (ray_domain_interval(origin, image.los, model.bounds, domain_min,
+                            domain_max)) {
+      double visible_min = domain_min;
+      if (visible_ray_interval(origin, image.los, model.opaque_objects,
+                               domain_min, domain_max, visible_min)) {
+        const double segment_length =
+            (domain_max - visible_min) / options.ray_samples;
+        if (segment_length > 0.0 && std::isfinite(segment_length)) {
+          for (std::size_t sample = 0; sample < options.ray_samples; ++sample) {
+            const double s =
+                visible_min + (sample + 0.5) * segment_length;
+            positions.push_back(
+                {origin.x + image.los.x * s,
+                 origin.y + image.los.y * s,
+                 origin.z + image.los.z * s});
+            segment_lengths.push_back(segment_length);
+          }
+        }
+      }
+    }
+    host_offsets[ray + 1] = positions.size();
+  }
+
+  std::vector<double> density_values;
+  std::vector<double> temperature_values;
+  std::vector<double> electron_values;
+  std::vector<double> ion_charge2_values;
+  model.evaluate(positions, density_values, temperature_values, electron_values,
+                 ion_charge2_values);
+
+  std::vector<std::array<double, kAdaptiveSegmentFieldCount>> host_segments(
+      positions.size());
+  for (std::size_t i = 0; i < positions.size(); ++i) {
+    const double density_ratio = density_values[i];
+    const double temperature_ratio = temperature_values[i];
+    const double electron_abundance = electron_values[i];
+    const double ion_charge2_abundance = ion_charge2_values[i];
+    if (!std::isfinite(density_ratio) || density_ratio < 0.0 ||
+        !std::isfinite(temperature_ratio) || temperature_ratio < 0.0 ||
+        !std::isfinite(electron_abundance) || electron_abundance < 0.0 ||
+        !std::isfinite(ion_charge2_abundance) ||
+        ion_charge2_abundance < 0.0) {
+      throw std::runtime_error(
+          "analytical flow functions must return finite, non-negative values");
+    }
+    if (density_ratio > 0.0 && temperature_ratio <= 0.0) {
+      throw std::runtime_error(
+          "temperature must be positive where density is non-zero");
+    }
+    const double temperature =
+        options.temperature_scale * temperature_ratio;
+    const double baryon_density =
+        options.number_density_scale * density_ratio;
+    const double electron_density = baryon_density * electron_abundance;
+    const double ion_charge2_density =
+        baryon_density * ion_charge2_abundance;
+    const double emission_measure = electron_density * ion_charge2_density;
+    const double ionic_charge =
+        electron_abundance > 0.0
+            ? ion_charge2_abundance / electron_abundance
+            : 0.0;
+    if (!std::isfinite(temperature) || !std::isfinite(emission_measure) ||
+        !std::isfinite(ionic_charge)) {
+      throw std::runtime_error(
+          "analytical flow values overflow physical normalization");
+    }
+    host_segments[i] = {{
+        temperature,
+        emission_measure,
+        ionic_charge,
+        segment_lengths[i],
+        0.0,
+        0.0,
+    }};
+  }
+  for (std::size_t ray = 0; ray < ray_count; ++ray) {
+    double maximum_remaining_temperature = 0.0;
+    for (std::size_t segment = host_offsets[ray];
+         segment < host_offsets[ray + 1]; ++segment) {
+      host_segments[segment][5] = maximum_remaining_temperature;
+      maximum_remaining_temperature =
+          std::max(maximum_remaining_temperature,
+                   host_segments[segment][0]);
+    }
+  }
+
+  AdaptiveSegmentView device_segments("analytical_ray_segments",
+                                      host_segments.size(),
+                                      kAdaptiveSegmentFieldCount);
+  auto device_segment_host = Kokkos::create_mirror_view(device_segments);
+  for (std::size_t i = 0; i < host_segments.size(); ++i) {
+    for (std::size_t field = 0; field < kAdaptiveSegmentFieldCount; ++field) {
+      device_segment_host(i, field) = host_segments[i][field];
+    }
+  }
+  Kokkos::deep_copy(device_segments, device_segment_host);
+
+  RayOffsetView device_offsets("analytical_ray_offsets", ray_count + 1);
+  auto device_offsets_host = Kokkos::create_mirror_view(device_offsets);
+  for (std::size_t i = 0; i < host_offsets.size(); ++i) {
+    device_offsets_host(i) = host_offsets[i];
+  }
+  Kokkos::deep_copy(device_offsets, device_offsets_host);
+  return {device_segments, device_offsets};
+}
+
+std::vector<std::array<double, 2>> regular_image_ray_coordinates(
+    const ImageGeometry& image) {
+  std::vector<std::array<double, 2>> coordinates;
+  coordinates.reserve(image.nx * image.ny);
+  for (std::size_t i = 0; i < image.nx; ++i) {
+    for (std::size_t j = 0; j < image.ny; ++j) {
+      coordinates.push_back({{
+          image.u_min + (i + 0.5) * image.du,
+          image.v_min + (j + 0.5) * image.dv,
+      }});
+    }
+  }
+  return coordinates;
+}
+
 Kokkos::View<double**> compute_image(const RaySampleView& samples,
                                      const ViewGeometry& view,
                                      const double frequency,
@@ -1641,8 +2605,9 @@ Kokkos::View<double**> compute_image(const RaySampleView& samples,
   return image;
 }
 
+template <typename ImageGeometryType>
 Kokkos::View<double**> compute_adaptive_image(
-    const AdaptiveRaySamples& samples, const ViewGeometry& view,
+    const AdaptiveRaySamples& samples, const ImageGeometryType& view,
     const double frequency, const double length_scale_cm,
     const double relative_intensity_threshold) {
   Kokkos::View<double**> image("adaptive_intensity_image", view.nx, view.ny);
@@ -1727,8 +2692,9 @@ void create_output_parent_directories(const std::string& path) {
   }
 }
 
+template <typename ImageGeometryType>
 double integrate_image(const Kokkos::View<double**>& image,
-                       const ViewGeometry& view,
+                       const ImageGeometryType& view,
                        const double length_scale) {
   auto host_image = Kokkos::create_mirror_view_and_copy(
       Kokkos::HostSpace(), image);
@@ -1788,7 +2754,75 @@ void write_spectrum(const std::string& path, const std::vector<double>& frequenc
   }
 }
 
+void write_analytical_spectrum(
+    const std::string& path, const std::vector<double>& frequencies,
+    const std::vector<double>& projected_intensity_areas,
+    const ImageGeometry& image, const AnalyticalModel& model,
+    const Options& options) {
+  create_output_parent_directories(path);
+  std::ofstream out(path);
+  if (!out) {
+    throw std::runtime_error("cannot open output spectrum: " + path);
+  }
+  out << std::setprecision(17);
+  out << "# projected intensity-area units: erg s^-1 Hz^-1\n";
+  out << "# n0_cm^-3: " << options.number_density_scale << '\n';
+  out << "# temperature0_k: " << options.temperature_scale << '\n';
+  out << "# length0_cm: " << options.length_scale_cm << '\n';
+  out << "# analytical_input: " << model.filename << '\n';
+  out << "# coordinates: " << model.coordinates << '\n';
+  out << "# image_resolution: " << image.nx << ',' << image.ny << '\n';
+  out << "# ray_samples: " << options.ray_samples << '\n';
+  out << "# ray_segment_length_units: R0\n";
+  out << "# domain_bounds_r0: ";
+  for (std::size_t i = 0; i < model.bounds.size(); ++i) {
+    if (i > 0) {
+      out << ',';
+    }
+    out << model.bounds[i];
+  }
+  out << '\n';
+  out << "# longitudinal_integration: uniform_midpoint\n";
+  out << "# line_of_sight: " << image.los.x << ',' << image.los.y << ','
+      << image.los.z << '\n';
+  out << "frequency_hz,projected_intensity_area\n";
+  for (std::size_t i = 0; i < frequencies.size(); ++i) {
+    out << frequencies[i] << ',' << projected_intensity_areas[i] << '\n';
+  }
+  if (!out) {
+    throw std::runtime_error("failed while writing output spectrum: " + path);
+  }
+}
+
+void run_analytical(const Options& options) {
+  const AnalyticalModel model(options.input);
+  const ImageGeometry image = make_image_geometry(model.bounds, options);
+  const std::vector<std::array<double, 2>> ray_coordinates =
+      regular_image_ray_coordinates(image);
+  const AdaptiveRaySamples ray_samples = build_analytical_ray_samples(
+      model, image, options, ray_coordinates);
+  const std::vector<double> frequencies = spectrum_frequencies(options);
+  std::vector<double> projected_intensity_areas;
+  projected_intensity_areas.reserve(frequencies.size());
+  for (const double frequency : frequencies) {
+    const auto intensity_image = compute_adaptive_image(
+        ray_samples, image, frequency, options.length_scale_cm,
+        options.relative_intensity_threshold);
+    projected_intensity_areas.push_back(
+        integrate_image(intensity_image, image, options.length_scale_cm));
+  }
+  write_analytical_spectrum(options.output, frequencies,
+                            projected_intensity_areas, image, model, options);
+  std::cout << "Wrote " << frequencies.size()
+            << " logarithmically spaced spectrum samples to " << options.output
+            << '\n';
+}
+
 void run(const Options& options) {
+  if (std::filesystem::path(options.input).extension() == ".py") {
+    run_analytical(options);
+    return;
+  }
   const Grid grid = read_grid(options.input);
   FieldView fields;
   if (!options.adaptive_longitudinal) {

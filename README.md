@@ -102,6 +102,59 @@ The Python input file is executed locally, so only use files you trust. Like
 the other `rff-flow` modes, this command writes both the `.rff` grid and its
 same-stem `.vtk` visualization file.
 
+## Direct analytical transfer
+
+`rff-transfer` executes the analytical input file locally and evaluates its
+profiles directly, without creating a Cartesian flow grid or an occultation
+mask. Only use Python files you trust:
+
+```sh
+rff-transfer --input runs/1/model.py --output runs/1/flow-spectrum.csv \
+  --n0 1e9 --temperature0 3e5 --length0 70 \
+  --frequency-min-hz 1e9 --frequency-max-hz 1e12 --frequency-count 100 \
+  --view-theta-deg 53 --view-phi-deg 0 \
+  --image-resolution 96 96 --ray-samples 128
+```
+
+The file defines Cartesian `bounds` in units of `R0`, a `coordinates` string
+(`"cartesian"`, `"cylindrical"`, or `"spherical"`), and vectorized
+`density(x1, x2, x3)`, `temperature(x1, x2, x3)`,
+`electron_per_baryon(x1, x2, x3)`, and
+`ion_charge2_per_baryon(x1, x2, x3)` functions. The argument coordinates are
+`(x, y, z)`, `(R, phi, z)`, or `(r, theta, phi)` respectively; angles are in
+radians, with spherical `theta` measured from +z. Functions receive NumPy
+arrays and may return arrays of matching shape or broadcastable scalars.
+`bounds` is ordered as `(xmin, xmax, ymin, ymax, zmin, zmax)`.
+Density and temperature are normalized by `n0` and `T0`; ionic abundances are
+dimensionless per-baryon ratios. `opaque_objects` is optional and may contain
+`{"shape": "sphere", "center": (x, y, z), "radius": r}` entries or
+`{"shape": "cylinder", "center": (x, y, z), "radius": r, "height": h,
+"axis": (ax, ay, az)}` entries. Dimensions are in `R0`; cylinder height is
+the full height and its axis is normalized by the solver. Objects must lie
+inside the computational bounds. Multiple and overlapping objects are
+supported; they are non-emitting and occult the flow analytically.
+
+`--image-resolution NU NV` sets the regularly spaced image-plane pixels
+(default `128 128`); the initial extent is the projection of all domain
+corners. `--ray-samples NS` sets uniform midpoint samples along each visible
+ray (default `128`). The solver evaluates the four flow functions in batches
+on the host, caches physical ray-segment quantities, and performs the
+frequency-dependent transfer with Kokkos. Segment lengths are dimensionless
+in `R0` and are multiplied by `--length0` exactly once for optical depths;
+projected pixel areas receive the square of that scale exactly once. Adaptive
+longitudinal integration is currently available only for `.rff` input.
+
+Building `rff-transfer` requires a Python development package, NumPy available
+to the Python interpreter selected by CMake, and Kokkos. The Python dependency
+is already included in the package requirements; if needed, install NumPy for
+the interpreter shown by CMake's `Found Python3` message. The example
+[`runs/1/model.py`](./runs/1/model.py) reproduces the spherical `r^-2` wind
+benchmark with a central sphere and finite cylinder. Its
+[`run.sh`](./runs/1/run.sh) runs the direct analytical solver. The CSV keeps
+the existing `frequency_hz,projected_intensity_area` spectrum format, with
+additional input, sampling, and viewing-direction metadata, so `rff-plot`
+continues to read it.
+
 To load simulation data, install the optional readers:
 
 ```sh
@@ -304,10 +357,15 @@ in `R0` units; `rff-plot` displays the resolution and box dimensions in the
 spectrum annotation. The CSV records `length0_cm` after converting the input
 solar radii to centimeters.
 
-Build against a Kokkos installation configured with CMake:
+Build against a Kokkos installation configured with CMake. `rff-transfer`
+embeds the selected Python interpreter, so it must have development headers
+and NumPy installed; set `Python3_EXECUTABLE` when CMake's default Python does
+not meet those requirements:
 
 ```sh
-cmake -S cpp -B build -DCMAKE_PREFIX_PATH=/path/to/kokkos
+cmake -S cpp -B build \
+  -DCMAKE_PREFIX_PATH=/path/to/kokkos \
+  -DPython3_EXECUTABLE=/path/to/python3
 cmake --build build --parallel
 ```
 

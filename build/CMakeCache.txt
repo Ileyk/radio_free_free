@@ -219,6 +219,9 @@ OpenMP_libomp_LIBRARY:FILEPATH=OpenMP_libomp_LIBRARY-NOTFOUND
 //No help, variable specified on the command line.
 OpenMP_omp_LIBRARY:UNINITIALIZED=/opt/homebrew/opt/libomp/lib/libomp.dylib
 
+//No help, variable specified on the command line.
+Python3_EXECUTABLE:UNINITIALIZED=/usr/bin/python3
+
 //Value Computed by CMake
 radio_free_free_BINARY_DIR:STATIC=/Users/ielm/Work/Codes/radio_free_free/build
 
@@ -375,6 +378,8 @@ CMAKE_WARN_DEPRECATED:INTERNAL=ON
 FIND_PACKAGE_MESSAGE_DETAILS_OpenMP:INTERNAL=[TRUE][found components: CXX ][v5.1()]
 //Details about finding OpenMP_CXX
 FIND_PACKAGE_MESSAGE_DETAILS_OpenMP_CXX:INTERNAL=[-Xclang -fopenmp][/opt/homebrew/opt/libomp/lib/libomp.dylib][v5.1()]
+//Details about finding Python3
+FIND_PACKAGE_MESSAGE_DETAILS_Python3:INTERNAL=[/usr/bin/python3][/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/include/python3.9][/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/libpython3.9.dylib][found components: Interpreter Development Development.Module Development.Embed ][v3.9.6()]
 //Result of TRY_COMPILE
 OpenMP_COMPILE_RESULT_CXX_Xclang fopenmp:INTERNAL=FALSE
 //ADVANCED property for variable: OpenMP_CXX_FLAGS
@@ -387,4 +392,24 @@ OpenMP_CXX_SPEC_DATE:INTERNAL=202011
 OpenMP_SPECTEST_CXX_:INTERNAL=TRUE
 //ADVANCED property for variable: OpenMP_libomp_LIBRARY
 OpenMP_libomp_LIBRARY-ADVANCED:INTERNAL=1
+//Compiler reason failure
+_Python3_Compiler_REASON_FAILURE:INTERNAL=
+_Python3_DEVELOPMENT_EMBED_SIGNATURE:INTERNAL=3ad6912b6c75b409e910494a9dda548d
+_Python3_DEVELOPMENT_MODULE_SIGNATURE:INTERNAL=5aa1a37d846a96b6ed233f72e77e197e
+//Development reason failure
+_Python3_Development_REASON_FAILURE:INTERNAL=
+_Python3_EXECUTABLE:INTERNAL=/usr/bin/python3
+//Path to a file.
+_Python3_INCLUDE_DIR:INTERNAL=/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/include/python3.9
+//Python3 Properties
+_Python3_INTERPRETER_PROPERTIES:INTERNAL=Python;3;9;6;64;<none>;cpython-39-darwin;abi3;;/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9;/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9;/Library/Python/3.9/site-packages;/Library/Python/3.9/site-packages
+_Python3_INTERPRETER_SIGNATURE:INTERNAL=e4651144cf83e5138c01a27471bec7d2
+//Interpreter reason failure
+_Python3_Interpreter_REASON_FAILURE:INTERNAL=
+//Path to a library.
+_Python3_LIBRARY_RELEASE:INTERNAL=/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/libpython3.9.dylib
+//Path to a file.
+_Python3_NumPy_INCLUDE_DIR:INTERNAL=_Python3_NumPy_INCLUDE_DIR-NOTFOUND
+//NumPy reason failure
+_Python3_NumPy_REASON_FAILURE:INTERNAL=
 
