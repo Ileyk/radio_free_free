@@ -603,6 +603,7 @@ bool refinement_criteria_pass(const FlowSample& center,
                               const FlowSample& left,
                               const FlowSample& right,
                               const double interval_length,
+                              const double length_scale_cm,
                               const std::vector<double>& frequencies,
                               const double tolerance) {
   if (!same_opacity(center, left, right)) {
@@ -613,11 +614,14 @@ bool refinement_criteria_pass(const FlowSample& center,
   }
   for (const double frequency : frequencies) {
     const SegmentOperator coarse =
-        segment_operator(center, frequency, interval_length);
+        segment_operator(center, frequency,
+                         interval_length * length_scale_cm);
     const SegmentOperator left_half =
-        segment_operator(left, frequency, interval_length * 0.5);
+        segment_operator(left, frequency,
+                         interval_length * length_scale_cm * 0.5);
     const SegmentOperator right_half =
-        segment_operator(right, frequency, interval_length * 0.5);
+        segment_operator(right, frequency,
+                         interval_length * length_scale_cm * 0.5);
     const double fine_absorption =
         one_minus_exp_negative(left_half.optical_depth +
                                right_half.optical_depth);
@@ -806,8 +810,8 @@ std::vector<double> adaptive_reference_frequencies(const Options& options) {
 template <typename Sampler>
 std::vector<AdaptiveSegment> refine_reference_ray(
     const double s_min, const double s_max, const double base_step,
-    const std::vector<double>& frequencies, const double tolerance,
-    Sampler&& sample_at) {
+    const std::vector<double>& frequencies, const double length_scale_cm,
+    const double tolerance, Sampler&& sample_at) {
   std::vector<AdaptiveSegment> segments;
   const std::size_t interval_count = samples_for_span(s_max - s_min, base_step);
   const double interval_step = (s_max - s_min) / interval_count;
@@ -865,7 +869,8 @@ std::vector<AdaptiveSegment> refine_reference_ray(
       return;
     }
     if (refinement_criteria_pass(center_sample, left_sample, right_sample,
-                                 upper - lower, frequencies, tolerance)) {
+                                 upper - lower, length_scale_cm, frequencies,
+                                 tolerance)) {
       if (segments.size() >= kMaximumAdaptiveSegmentsPerRay) {
         throw std::runtime_error(
             "adaptive longitudinal ray exceeds the segment limit");
@@ -1066,6 +1071,7 @@ AdaptiveRaySamples build_adaptive_ray_samples(
       };
       std::vector<AdaptiveSegment> reference = refine_reference_ray(
           clipped_min, clipped_max, view.ds, frequencies,
+          options.length_scale_cm,
           options.integration_tolerance, sample_at);
       reference = visible_ray_segments(std::move(reference));
       const std::vector<AdaptiveSegment> compressed = compress_ray_segments(
