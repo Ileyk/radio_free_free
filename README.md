@@ -171,17 +171,19 @@ rff-occult wind.rff occulted-wind.rff --shape cylinder \
 The cylinder is centered on the given coordinates; `--height` is its full
 length, and `--axis` selects x, y, or z (default z). The mask is sampled at
 flow cell centers. Run `rff-transfer` with the resulting output file as its
-input to activate occultation. A ray crossing an opaque cell loses all
-background emission behind it, while foreground flow remains visible.
+input to activate occultation. Rays are traversed from the observer side, and
+integration stops at the first opaque sample encountered. Emission accumulated
+in front of that surface remains visible; emission at or behind it is excluded.
 
 ## Plot radio outputs
 
-Use `rff-plot` to inspect either CSV output from `rff-transfer`; the format is
-detected from its header:
+Use `rff-plot` to inspect spectrum CSV output from `rff-transfer`; the format
+is detected from its header. The plotter also remains able to read legacy
+image CSVs created by older transfer versions:
 
 ```sh
-rff-plot wind-image.csv --distance-pc 100
 rff-plot wind-spectrum.csv --distance-pc 100
+rff-plot legacy-wind-image.csv --distance-pc 100
 ```
 
 For separate runs, keep a `run.sh` and outputs in a subfolder and pass their
@@ -190,19 +192,18 @@ creates missing output directories, and `rff-plot runs/wind-a/spectrum.csv`
 opens that result interactively. `rff-flow` and `rff-occult` also create the
 parent directories for their `.rff` and `.vtk` outputs.
 
-Image plots show specific intensity over the projected `u`/`v` plane, with
-frequency and viewing direction in the title when available; the distance-
-scaled integrated flux is annotated in mJy. Spectrum plots show integrated
-flux density in mJy versus frequency in GHz on logarithmic axes (the flux
-axis is linear if the data contain zeros). Spectrum plots also include a
-lower-right scale legend with `n0`, `T0`, and `R0` in solar radii. An
-unchecked `Linford et al. (2019)` checkbox overlays the comparison points from
-`linford_19.txt` on spectrum plots when selected. Both plots
-include a logarithmic distance slider; `--distance-pc` sets its initial value.
-Distance rescales flux as inverse-square while leaving image intensity
-unchanged. Use `--mode image` or `--mode spectrum` to override automatic format
-detection. Outputs from older `rff-transfer` versions lack the metadata needed
-to rescale with distance; regenerate them to use the slider.
+Spectrum plots show integrated flux density in mJy versus frequency in GHz on
+logarithmic axes (the flux axis is linear if the data contain zeros). They
+include a lower-right scale legend with `n0`, `T0`, `R0`, grid resolution, and
+box dimensions. An unchecked `Linford et al. (2019)` checkbox overlays the
+comparison points from `linford_19.txt` when selected. The logarithmic
+distance slider sets the inverse-square flux scaling; `--distance-pc` sets its
+initial value. Legacy image plots show specific intensity over the projected
+`u`/`v` plane, with the distance-scaled integrated flux annotated in mJy. Use
+`--mode image` only for legacy image CSVs, or `--mode spectrum` to force
+spectrum parsing.
+Outputs from older `rff-transfer` versions lack metadata needed to rescale
+with distance; regenerate them to use the slider.
 
 ## Transfer model
 
@@ -224,45 +225,64 @@ j_nu      = alpha_nu B_nu(T)
 dI_nu/ds  = -alpha_nu I_nu + j_nu
 ```
 
-The transfer is integrated along each ray using the exact constant-step update
-`I_out = I_in exp(-tau) + B_nu(T) (1 - exp(-tau))`. Both exponentials use
-stable forms near zero optical depth. This includes stimulated emission and
-does not assume the Rayleigh-Jeans limit.
+The transfer is integrated from the observer-facing boundary toward the far
+side. For each cell, its contribution is added as
+`exp(-tau_foreground) B_nu(T) (1 - exp(-delta_tau))`, then its optical depth
+is added to `tau_foreground`. Both exponentials use stable forms near zero
+optical depth. This includes stimulated emission and does not assume the
+Rayleigh-Jeans limit. An opaque cell stops the traversal while preserving
+emission already accumulated in the foreground.
+
+For each ray, the solver caches the maximum temperature in the still-unvisited
+samples. Since `B_nu(T)` increases with temperature, this gives an upper bound
+on their source function. The solver stops when the foreground-transmitted
+bound is less than the configured fraction of that remaining source-function
+bound. The default `--relative-intensity-threshold` is `1e-3`; the underscore
+form `--relative_intensity_threshold` is also accepted. The value must be
+greater than zero and less than one.
+
+Adaptive longitudinal integration is opt-in with `--adaptive-longitudinal`.
+It starts from the ray's spatial intervals and refines them using midpoint
+versus two-half-step estimates for both the emitted source contribution and
+the absorbed fraction. It tests reference frequencies spaced by half a decade
+over the requested frequency range and accepts an interval only when both
+estimates meet `--integration-tolerance` at every reference frequency. The
+default tolerance is `1e-3`. Neighboring intervals are then merged only when
+their transfer operators agree within that tolerance; the compressed ray is
+checked against the refined reference ray at every reference frequency, and
+the reference representation is used if verification fails. Without
+`--adaptive-longitudinal`, the existing fixed spatial sampling is used.
+`--integration-tolerance` is only valid when adaptive integration is enabled.
+Reference frequencies include both requested band endpoints. Adaptive
+refinement, compression, and verification are host-side preprocessing; the
+per-frequency ray transfer still runs on the selected Kokkos backend.
+
 Here `T` is the local physical temperature in K and `nu` is the observing
 frequency in Hz; `T_4 = T / 10^4 K` and `nu_9 = nu / 10^9 Hz`. For a flow
 with one ion species, `Z_i,eff` equals its ionic charge number. For mixtures,
 the flow's aggregate composition fields define the effective value as
 `(sum_i Z_i^2 n_i) / (sum_i Z_i n_i)`. `rff-transfer` computes `g_ff` from
-the interpolated temperature and effective charge at every transfer sample.
-In image mode it uses the requested frequency; in spectrum mode it recomputes
-the factor for each frequency.
+the interpolated temperature and effective charge at every transfer sample
+for every frequency in the spectrum.
 
-The flow preparation and viewing tools operate on dimensionless coordinates
-in units of `R0`. Set the physical size of one `R0` coordinate unit with
+The flow preparation tools operate on dimensionless coordinates in units of
+`R0`. Set the physical size of one `R0` coordinate unit with
 `rff-transfer --length0`, in solar radii. The executable converts this value
-to centimeters internally. Image mode calculates a specific intensity map
-at one frequency:
-
-```sh
-./build/rff-transfer --mode image --input wind.rff --output wind-image.csv \
-  --n0 5.98e5 --temperature0 1e4 --length0 215.61 \
-  --frequency-hz 1e10 --view-theta-deg 30 --view-phi-deg 45
-```
-
-The image CSV contains intensities in `erg s^-1 cm^-2 Hz^-1 sr^-1`, with
-projected coordinates in `R0`, plus projected pixel area in cm^2 for flux
-postprocessing. Spectrum mode calculates the projected intensity-area
-integral at logarithmically spaced frequencies, including both endpoints:
+to centimeters internally. `rff-transfer` computes a spectrum and calculates
+the projected intensity-area integral at logarithmically spaced frequencies,
+including both endpoints:
 
 ```sh
 ./build/rff-transfer --mode spectrum --input wind.rff --output wind-spectrum.csv \
   --n0 5.98e5 --temperature0 1e4 --length0 215.61 \
   --frequency-min-hz 1e8 --frequency-max-hz 1e12 --frequency-count 100 \
-  --view-theta-deg 30 --view-phi-deg 45
+  --view-theta-deg 30 --view-phi-deg 45 \
+  --relative-intensity-threshold 1e-3 \
+  --adaptive-longitudinal --integration-tolerance 1e-3
 ```
 
 The spectrum CSV contains frequency in Hz and the projected intensity-area
-integral in `erg s^-1 Hz^-1`. The viewing-angle options apply to both modes.
+integral in `erg s^-1 Hz^-1`. The viewing-angle options apply to the spectrum.
 `rff-plot` converts this integral to observed flux density using
 `F_nu = integral / distance_cm^2`; flux density is displayed in mJy. The `.rff`
 flow no longer contains a Gaunt-factor field. Output CSV metadata stores
@@ -293,10 +313,10 @@ cmake --build build --parallel
 ```
 
 Kokkos chooses the enabled execution backend at build time (for example
-OpenMP/Serial or CUDA/HIP). Both output modes run on the selected backend.
+OpenMP/Serial or CUDA/HIP). Spectrum calculations run on the selected backend.
 
 The required normalizations are `n0` in cm^-3, `temperature0` in K,
-`length0` in solar radii, and observing frequency or spectrum bounds in Hz. `n0`,
+`length0` in solar radii, and spectrum frequency bounds in Hz. `n0`,
 `temperature0`, and `length0` define the physical scaling of the dimensionless
 flow. Source distance is not used by `rff-transfer`; set it in `rff-plot`.
 
@@ -307,4 +327,5 @@ PYTHONPATH=python python -m unittest discover -s python/tests -v
 ```
 
 The tests cover cell-centered function sampling, binary round-tripping, wind
-normalization, and input validation.
+normalization, and input validation. When `build/rff-transfer` is available,
+they also compare adaptive and fixed transfer and check opaque-surface handling.
