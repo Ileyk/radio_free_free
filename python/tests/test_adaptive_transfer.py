@@ -100,6 +100,30 @@ class AdaptiveTransferTests(unittest.TestCase):
 
         np.testing.assert_allclose(loose, tight, rtol=2e-3, atol=0)
 
+    def test_adaptive_pilot_recovers_missed_sparse_emission(self):
+        shape = (3, 3, 3)
+        density = np.zeros(shape)
+        density[0, 0, 0] = 1.0
+        ones = np.ones(shape)
+        flow = FlowGrid((-1, 1, -1, 1, -1, 1), density, ones, ones, ones)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            values, _ = self.run_transfer(
+                flow,
+                Path(temporary_directory),
+                "sparse-emission",
+                (
+                    "--adaptive-longitudinal",
+                    "--view-theta-deg",
+                    "30",
+                    "--view-phi-deg",
+                    "20",
+                ),
+            )
+
+        self.assertTrue(np.all(np.isfinite(values)))
+        self.assertTrue(np.all(values > 0.0))
+
     def test_adaptive_ray_stops_at_opaque_surface_and_keeps_foreground(self):
         shape = (1, 1, 2)
         ones = np.ones(shape)
@@ -137,6 +161,40 @@ class AdaptiveTransferTests(unittest.TestCase):
         self.assertTrue(np.all(far_values > 0))
         self.assertTrue(np.all(near_values == 0))
         self.assertTrue(np.all(far_values < clear_values))
+
+    def test_adaptive_recovers_opaque_intersection_missed_by_initial_scan(self):
+        shape = (3, 3, 3)
+        ones = np.ones(shape)
+        occultation_mask = np.zeros(shape)
+        occultation_mask[1, 2, 1] = 1.0
+        clear_flow = FlowGrid((-1, 1, -1, 1, -1, 1), ones, ones, ones, ones)
+        occulted_flow = FlowGrid(
+            (-1, 1, -1, 1, -1, 1),
+            ones,
+            ones,
+            ones,
+            ones,
+            occultation_mask=occultation_mask,
+        )
+        options = (
+            "--adaptive-longitudinal",
+            "--view-theta-deg",
+            "168",
+            "--view-phi-deg",
+            "54",
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            clear_values, _ = self.run_transfer(
+                clear_flow, directory, "clear-oblique", options
+            )
+            occulted_values, _ = self.run_transfer(
+                occulted_flow, directory, "occulted-oblique", options
+            )
+
+        self.assertTrue(np.all(occulted_values > 0.0))
+        self.assertTrue(np.all(occulted_values < clear_values))
 
     def test_early_termination_uses_accumulated_intensity(self):
         shape = (1, 1, 2)

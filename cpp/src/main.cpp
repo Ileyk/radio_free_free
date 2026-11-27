@@ -148,6 +148,68 @@ struct FlowSample {
   bool opaque = false;
 };
 
+std::vector<double> image_intensity_scales(
+    const Grid& grid, const ViewGeometry& view, const Options& options,
+    const std::vector<double>& frequencies) {
+  const double dx = (grid.bounds[1] - grid.bounds[0]) / grid.nx;
+  const double dy = (grid.bounds[3] - grid.bounds[2]) / grid.ny;
+  const double dz = (grid.bounds[5] - grid.bounds[4]) / grid.nz;
+  const double cell_volume_cm3 =
+      dx * dy * dz * options.length_scale_cm * options.length_scale_cm *
+      options.length_scale_cm;
+  const double image_area_cm2 =
+      view.nx * view.du * view.ny * view.dv * options.length_scale_cm *
+      options.length_scale_cm;
+  const double density_scale_squared =
+      options.number_density_scale * options.number_density_scale;
+  std::vector<double> scales;
+  scales.reserve(frequencies.size());
+  for (const double frequency : frequencies) {
+    double optically_thin_flux = 0.0;
+    double maximum_emitting_temperature = 0.0;
+    for (std::size_t cell = 0; cell < grid.nx * grid.ny * grid.nz; ++cell) {
+      const std::size_t offset = cell * kFieldCount;
+      const double density_ratio = grid.fields[offset];
+      const double temperature =
+          options.temperature_scale * grid.fields[offset + 1];
+      const double electron_abundance = grid.fields[offset + 2];
+      const double ion_charge2_abundance = grid.fields[offset + 3];
+      if (density_ratio <= 0.0 || temperature <= 0.0 ||
+          electron_abundance <= 0.0 || ion_charge2_abundance <= 0.0) {
+        continue;
+      }
+      const double emission_measure =
+          density_scale_squared * density_ratio * density_ratio *
+          electron_abundance * ion_charge2_abundance;
+      maximum_emitting_temperature =
+          std::max(maximum_emitting_temperature, temperature);
+      const double ionic_charge =
+          ion_charge2_abundance / electron_abundance;
+      const double x_nu =
+          kPlanck * frequency / (kBoltzmann * temperature);
+      const double alpha =
+          kFreeFreeCoefficient / (frequency * frequency * frequency) *
+          std::sqrt(1.0 / temperature) * emission_measure *
+          one_minus_exp_negative(x_nu) *
+          free_free_gaunt_factor(temperature, frequency, ionic_charge);
+      optically_thin_flux +=
+          alpha * planck_source_function(frequency, temperature) *
+          cell_volume_cm3;
+    }
+    const double blackbody_upper_bound =
+        maximum_emitting_temperature > 0.0
+            ? planck_source_function(frequency, maximum_emitting_temperature)
+            : 0.0;
+    const double scale = std::min(optically_thin_flux / image_area_cm2,
+                                  blackbody_upper_bound);
+    scales.push_back(
+        scale > 0.0 && std::isfinite(scale)
+            ? scale
+            : std::numeric_limits<double>::min());
+  }
+  return scales;
+}
+
 struct AdaptiveSegment {
   double lower = 0.0;
   double upper = 0.0;
@@ -164,11 +226,17 @@ struct AdaptiveContext {
   double ray_intensity = 0.0;
   double incoming_intensity = 0.0;
   double foreground_transmission = 1.0;
+  double pilot_interval_source = 0.0;
+  double pilot_interval_transmission = 1.0;
 };
 
 struct AdaptiveRaySamples {
   AdaptiveSegmentView segments;
   RayOffsetView offsets;
+};
+
+struct OpaqueIntersectionDetected {
+  double position;
 };
 
 void usage(std::ostream& out) {
@@ -641,7 +709,8 @@ double relative_difference(const double first, const double second) {
 
 std::vector<std::vector<AdaptiveContext>> build_pilot_contexts(
     const std::vector<FlowSample>& samples,
-    const std::vector<double>& frequencies, const double interval_length_cm) {
+    const std::vector<double>& frequencies, const double interval_length_cm,
+    const std::vector<double>& image_scales) {
   std::vector<std::vector<AdaptiveContext>> contexts(
       samples.size(), std::vector<AdaptiveContext>(frequencies.size()));
   for (std::size_t frequency_index = 0;
@@ -655,6 +724,10 @@ std::vector<std::vector<AdaptiveContext>> build_pilot_contexts(
       const SegmentOperator operation =
           segment_operator(samples[i], frequency, interval_length_cm);
       operations.push_back(operation);
+      contexts[i][frequency_index].pilot_interval_source =
+          operation.source_contribution;
+      contexts[i][frequency_index].pilot_interval_transmission =
+          operation.transmission;
       pilot_intensity =
           operation.transmission * pilot_intensity +
           operation.source_contribution;
@@ -662,7 +735,8 @@ std::vector<std::vector<AdaptiveContext>> build_pilot_contexts(
     double foreground_transmission = 1.0;
     for (std::size_t i = samples.size(); i > 0; --i) {
       AdaptiveContext& context = contexts[i - 1][frequency_index];
-      context.ray_intensity = pilot_intensity;
+      context.ray_intensity =
+          std::max(pilot_intensity, image_scales[frequency_index]);
       context.foreground_transmission = foreground_transmission;
       foreground_transmission *= operations[i - 1].transmission;
     }
@@ -672,7 +746,8 @@ std::vector<std::vector<AdaptiveContext>> build_pilot_contexts(
 
 std::vector<std::vector<AdaptiveContext>> build_segment_pilot_contexts(
     const std::vector<AdaptiveSegment>& segments,
-    const std::vector<double>& frequencies, const double length_scale_cm) {
+    const std::vector<double>& frequencies, const double length_scale_cm,
+    const std::vector<double>& image_scales) {
   std::vector<std::vector<AdaptiveContext>> contexts(
       segments.size(), std::vector<AdaptiveContext>(frequencies.size()));
   for (std::size_t frequency_index = 0;
@@ -687,6 +762,10 @@ std::vector<std::vector<AdaptiveContext>> build_segment_pilot_contexts(
           segments[i].sample, frequency,
           (segments[i].upper - segments[i].lower) * length_scale_cm);
       operations.push_back(operation);
+      contexts[i][frequency_index].pilot_interval_source =
+          operation.source_contribution;
+      contexts[i][frequency_index].pilot_interval_transmission =
+          operation.transmission;
       pilot_intensity =
           operation.transmission * pilot_intensity +
           operation.source_contribution;
@@ -694,7 +773,8 @@ std::vector<std::vector<AdaptiveContext>> build_segment_pilot_contexts(
     double foreground_transmission = 1.0;
     for (std::size_t i = segments.size(); i > 0; --i) {
       AdaptiveContext& context = contexts[i - 1][frequency_index];
-      context.ray_intensity = pilot_intensity;
+      context.ray_intensity =
+          std::max(pilot_intensity, image_scales[frequency_index]);
       context.foreground_transmission = foreground_transmission;
       foreground_transmission *= operations[i - 1].transmission;
     }
@@ -709,7 +789,8 @@ bool refinement_criteria_pass(
     const std::vector<double>& frequencies,
     const std::vector<AdaptiveContext>& contexts, const double tolerance,
     std::vector<SegmentOperator>& left_operations,
-    std::vector<SegmentOperator>& right_operations) {
+    std::vector<SegmentOperator>& right_operations,
+    bool& pilot_missed_emission) {
   bool passes = true;
   left_operations.clear();
   right_operations.clear();
@@ -736,6 +817,11 @@ bool refinement_criteria_pass(
         right_half.transmission * left_half.source_contribution +
         right_half.source_contribution;
     const AdaptiveContext& context = contexts[i];
+    if (context.pilot_interval_source == 0.0 &&
+        (coarse.source_contribution > 0.0 || fine_source > 0.0)) {
+      pilot_missed_emission = true;
+      return false;
+    }
     const double local_error =
         context.foreground_transmission *
         (std::abs(coarse.source_contribution - fine_source) +
@@ -743,6 +829,9 @@ bool refinement_criteria_pass(
              std::abs(context.incoming_intensity));
     const double local_budget =
         tolerance * context.ray_intensity * interval_fraction;
+    // The squared relative-error shares sum to the ray-level tolerance squared.
+    const double local_relative_tolerance =
+        tolerance * std::sqrt(interval_fraction);
     if (local_error > local_budget) {
       passes = false;
     }
@@ -752,7 +841,7 @@ bool refinement_criteria_pass(
         std::max(std::abs(coarse.source_contribution), std::abs(fine_source));
     if (emission_scale > local_budget &&
         relative_difference(coarse.source_contribution, fine_source) >
-            tolerance) {
+            local_relative_tolerance) {
       passes = false;
     }
     const double transmission_scale =
@@ -762,7 +851,7 @@ bool refinement_criteria_pass(
                  std::abs(fine_transmission));
     if (transmission_scale > local_budget &&
         relative_difference(coarse.transmission, fine_transmission) >
-            tolerance) {
+            local_relative_tolerance) {
       passes = false;
     }
   }
@@ -941,26 +1030,63 @@ template <typename Sampler>
 std::vector<AdaptiveSegment> refine_reference_ray(
     const double s_min, const double s_max, const double base_step,
     const std::vector<double>& frequencies, const double length_scale_cm,
-    const double tolerance, Sampler&& sample_at) {
+    const std::vector<double>& image_scales, const double tolerance,
+    const std::size_t pilot_subdivisions, bool& pilot_missed_emission,
+    Sampler&& sample_at) {
   std::vector<AdaptiveSegment> segments;
   const std::size_t interval_count = samples_for_span(s_max - s_min, base_step);
   const double interval_step = (s_max - s_min) / interval_count;
   const double ray_length_cm = (s_max - s_min) * length_scale_cm;
+  if (interval_count >
+      kMaximumAdaptiveSegmentsPerRay / pilot_subdivisions) {
+    throw std::runtime_error(
+        "adaptive pilot integration exceeds the segment limit");
+  }
+  const std::size_t pilot_count = interval_count * pilot_subdivisions;
+  const double pilot_step = (s_max - s_min) / pilot_count;
   std::vector<FlowSample> pilot_samples;
-  pilot_samples.reserve(interval_count);
-  for (std::size_t i = 0; i < interval_count; ++i) {
-    const double midpoint =
-        s_min + (i + 0.5) * interval_step;
+  pilot_samples.reserve(pilot_count);
+  double nearest_opaque = -std::numeric_limits<double>::infinity();
+  for (std::size_t i = 0; i < pilot_count; ++i) {
+    const double midpoint = s_min + (i + 0.5) * pilot_step;
     const FlowSample sample = sample_at(midpoint);
     if (sample.opaque) {
-      throw std::runtime_error(
-          "visible adaptive ray still intersects an opaque region");
+      nearest_opaque = midpoint;
     }
     pilot_samples.push_back(sample);
   }
-  const std::vector<std::vector<AdaptiveContext>> pilot_contexts =
+  if (std::isfinite(nearest_opaque)) {
+    throw OpaqueIntersectionDetected{nearest_opaque};
+  }
+  const std::vector<std::vector<AdaptiveContext>> fine_pilot_contexts =
       build_pilot_contexts(pilot_samples, frequencies,
-                           interval_step * length_scale_cm);
+                           pilot_step * length_scale_cm, image_scales);
+  std::vector<std::vector<AdaptiveContext>> pilot_contexts(
+      interval_count, std::vector<AdaptiveContext>(frequencies.size()));
+  for (std::size_t interval = 0; interval < interval_count; ++interval) {
+    const std::size_t first = interval * pilot_subdivisions;
+    const std::size_t last = first + pilot_subdivisions - 1;
+    for (std::size_t frequency_index = 0;
+         frequency_index < frequencies.size(); ++frequency_index) {
+      AdaptiveContext context = fine_pilot_contexts[first][frequency_index];
+      context.foreground_transmission =
+          fine_pilot_contexts[last][frequency_index].foreground_transmission;
+      double interval_source = 0.0;
+      double interval_transmission = 1.0;
+      for (std::size_t sample = first; sample <= last; ++sample) {
+        const AdaptiveContext& sample_context =
+            fine_pilot_contexts[sample][frequency_index];
+        interval_source =
+            sample_context.pilot_interval_transmission * interval_source +
+            sample_context.pilot_interval_source;
+        interval_transmission *=
+            sample_context.pilot_interval_transmission;
+      }
+      context.pilot_interval_source = interval_source;
+      context.pilot_interval_transmission = interval_transmission;
+      pilot_contexts[interval][frequency_index] = context;
+    }
+  }
 
   auto append_segment = [&](const double lower, const double upper,
                             const FlowSample& sample) {
@@ -973,6 +1099,9 @@ std::vector<AdaptiveSegment> refine_reference_ray(
   auto refine = [&](auto&& self, const double lower, const double upper,
                     const int depth,
                     const std::vector<AdaptiveContext>& contexts) -> void {
+    if (pilot_missed_emission) {
+      return;
+    }
     const double middle = lower + (upper - lower) * 0.5;
     const FlowSample center_sample = sample_at(middle);
     const double left_middle = lower + (middle - lower) * 0.5;
@@ -980,18 +1109,30 @@ std::vector<AdaptiveSegment> refine_reference_ray(
     const FlowSample left_sample = sample_at(left_middle);
     const FlowSample right_sample = sample_at(right_middle);
     if (center_sample.opaque || left_sample.opaque || right_sample.opaque) {
-      throw std::runtime_error(
-          "visible adaptive ray still intersects an opaque region");
+      double nearest_opaque = -std::numeric_limits<double>::infinity();
+      if (center_sample.opaque) {
+        nearest_opaque = middle;
+      }
+      if (left_sample.opaque) {
+        nearest_opaque = std::max(nearest_opaque, left_middle);
+      }
+      if (right_sample.opaque) {
+        nearest_opaque = std::max(nearest_opaque, right_middle);
+      }
+      throw OpaqueIntersectionDetected{nearest_opaque};
     }
     std::vector<SegmentOperator> left_operations;
     std::vector<SegmentOperator> right_operations;
     const bool passes = refinement_criteria_pass(
         center_sample, left_sample, right_sample, upper - lower,
         ray_length_cm, length_scale_cm, frequencies, contexts, tolerance,
-        left_operations, right_operations);
+        left_operations, right_operations, pilot_missed_emission);
     if (passes) {
       append_segment(lower, middle, left_sample);
       append_segment(middle, upper, right_sample);
+      return;
+    }
+    if (pilot_missed_emission) {
       return;
     }
     if (depth >= kMaximumAdaptiveDepth || !(middle > lower && middle < upper)) {
@@ -1001,17 +1142,18 @@ std::vector<AdaptiveSegment> refine_reference_ray(
     std::vector<AdaptiveContext> left_contexts(contexts.size());
     std::vector<AdaptiveContext> right_contexts(contexts.size());
     for (std::size_t i = 0; i < contexts.size(); ++i) {
-      left_contexts[i] = {
-          contexts[i].ray_intensity,
-          contexts[i].incoming_intensity,
+      left_contexts[i] = contexts[i];
+      left_contexts[i].foreground_transmission =
           contexts[i].foreground_transmission *
-              right_operations[i].transmission};
-      right_contexts[i] = {
-          contexts[i].ray_intensity,
+          right_operations[i].transmission;
+
+      right_contexts[i] = contexts[i];
+      right_contexts[i].incoming_intensity =
           left_operations[i].transmission *
-                  contexts[i].incoming_intensity +
-              left_operations[i].source_contribution,
-          contexts[i].foreground_transmission};
+              contexts[i].incoming_intensity +
+          left_operations[i].source_contribution;
+      right_contexts[i].foreground_transmission =
+          contexts[i].foreground_transmission;
     }
     self(self, lower, middle, depth + 1, left_contexts);
     self(self, middle, upper, depth + 1, right_contexts);
@@ -1023,8 +1165,118 @@ std::vector<AdaptiveSegment> refine_reference_ray(
                              ? s_max
                              : s_min + (i + 1) * interval_step;
     refine(refine, lower, upper, 0, pilot_contexts[i]);
+    if (pilot_missed_emission) {
+      return {};
+    }
   }
   return segments;
+}
+
+double integrate_adaptive_ray(const std::vector<AdaptiveSegment>& segments,
+                              double frequency, double length_scale_cm);
+
+template <typename Sampler>
+void verify_reference_ray(std::vector<AdaptiveSegment>& segments,
+                          const double ray_length_cm,
+                          const std::vector<double>& frequencies,
+                          const std::vector<double>& image_scales,
+                          const double length_scale_cm,
+                          const double tolerance, Sampler&& sample_at) {
+  for (int iteration = 0; iteration <= kMaximumAdaptiveDepth; ++iteration) {
+    const std::vector<std::vector<AdaptiveContext>> contexts =
+        build_segment_pilot_contexts(segments, frequencies, length_scale_cm,
+                                     image_scales);
+    std::vector<AdaptiveSegment> refined;
+    std::vector<AdaptiveSegment> probe_refined;
+    refined.reserve(segments.size());
+    probe_refined.reserve(segments.size() * 2);
+    bool needs_refinement = false;
+    for (std::size_t i = 0; i < segments.size(); ++i) {
+      const AdaptiveSegment& segment = segments[i];
+      const double middle =
+          segment.lower + (segment.upper - segment.lower) * 0.5;
+      const double left_middle = segment.lower + (middle - segment.lower) * 0.5;
+      const double right_middle = middle + (segment.upper - middle) * 0.5;
+      const FlowSample left_sample = sample_at(left_middle);
+      const FlowSample right_sample = sample_at(right_middle);
+      if (segment.sample.opaque || left_sample.opaque || right_sample.opaque) {
+        double nearest_opaque = -std::numeric_limits<double>::infinity();
+        if (segment.sample.opaque) {
+          nearest_opaque = middle;
+        }
+        if (left_sample.opaque) {
+          nearest_opaque = std::max(nearest_opaque, left_middle);
+        }
+        if (right_sample.opaque) {
+          nearest_opaque = std::max(nearest_opaque, right_middle);
+        }
+        throw OpaqueIntersectionDetected{nearest_opaque};
+      }
+      probe_refined.push_back({segment.lower, middle, left_sample});
+      probe_refined.push_back({middle, segment.upper, right_sample});
+
+      const FlowSample& center_sample = segment.sample;
+      std::vector<SegmentOperator> left_operations;
+      std::vector<SegmentOperator> right_operations;
+      bool pilot_missed_emission = false;
+      if (refinement_criteria_pass(
+              center_sample, left_sample, right_sample,
+              segment.upper - segment.lower, ray_length_cm, length_scale_cm,
+              frequencies, contexts[i], tolerance, left_operations,
+              right_operations, pilot_missed_emission)) {
+        refined.push_back(segment);
+        continue;
+      }
+
+      const double split = middle;
+      if (iteration == kMaximumAdaptiveDepth ||
+          !(split > segment.lower && split < segment.upper)) {
+        throw std::runtime_error(
+            "adaptive longitudinal refinement did not converge");
+      }
+      if (refined.size() + (segments.size() - i) + 1 >
+          kMaximumAdaptiveSegmentsPerRay) {
+        throw std::runtime_error(
+            "adaptive longitudinal ray exceeds the segment limit");
+      }
+      refined.push_back({segment.lower, split, left_sample});
+      refined.push_back({split, segment.upper, right_sample});
+      needs_refinement = true;
+    }
+
+    bool globally_converged = true;
+    for (std::size_t i = 0; i < frequencies.size(); ++i) {
+      const double current_intensity = integrate_adaptive_ray(
+          segments, frequencies[i], length_scale_cm);
+      const double refined_intensity = integrate_adaptive_ray(
+          probe_refined, frequencies[i], length_scale_cm);
+      const double absolute_budget =
+          tolerance * contexts.front()[i].ray_intensity;
+      const double intensity_scale =
+          std::max(std::abs(current_intensity), std::abs(refined_intensity));
+      if (std::abs(current_intensity - refined_intensity) > absolute_budget ||
+          (intensity_scale > absolute_budget &&
+           relative_difference(current_intensity, refined_intensity) >
+               tolerance)) {
+        globally_converged = false;
+        break;
+      }
+    }
+    if (!needs_refinement && globally_converged) {
+      return;
+    }
+    if (needs_refinement) {
+      segments = std::move(refined);
+    } else {
+      if (probe_refined.size() > kMaximumAdaptiveSegmentsPerRay) {
+        throw std::runtime_error(
+            "adaptive longitudinal ray exceeds the segment limit");
+      }
+      segments = std::move(probe_refined);
+    }
+  }
+  throw std::runtime_error(
+      "adaptive longitudinal refinement did not converge");
 }
 
 bool merged_operator_matches(const std::vector<AdaptiveSegment>& reference,
@@ -1062,6 +1314,8 @@ bool merged_operator_matches(const std::vector<AdaptiveSegment>& reference,
         contexts[end - 1][frequency_index];
     const double local_budget =
         tolerance * incoming.ray_intensity * interval_fraction;
+    const double local_relative_tolerance =
+        tolerance * std::sqrt(interval_fraction);
     const double local_error =
         outgoing.foreground_transmission *
         (std::abs(reference_source -
@@ -1082,11 +1336,11 @@ bool merged_operator_matches(const std::vector<AdaptiveSegment>& reference,
         (emission_scale > local_budget &&
          relative_difference(reference_source,
                              candidate_operation.source_contribution) >
-             tolerance) ||
+             local_relative_tolerance) ||
         (transmission_scale > local_budget &&
          relative_difference(reference_transmission,
                              candidate_operation.transmission) >
-             tolerance)) {
+             local_relative_tolerance)) {
       return false;
     }
   }
@@ -1180,6 +1434,8 @@ AdaptiveRaySamples build_adaptive_ray_samples(
   const double y_max = grid.bounds[3];
   const double z_min = grid.bounds[4];
   const double z_max = grid.bounds[5];
+  const std::vector<double> image_scales =
+      image_intensity_scales(grid, view, options, frequencies);
 
   for (std::size_t pixel = 0; pixel < pixel_count; ++pixel) {
     const std::size_t i = pixel / view.ny;
@@ -1225,15 +1481,67 @@ AdaptiveRaySamples build_adaptive_ray_samples(
                            origin_y + losy * s, origin_z + losz * s);
       };
       double visible_min = clipped_min;
-      const bool has_visible_material = clip_to_nearest_opaque_boundary(
+      bool has_visible_material = clip_to_nearest_opaque_boundary(
           clipped_min, clipped_max, view.ds, sample_at, visible_min);
       if (has_visible_material) {
-        const std::vector<AdaptiveSegment> reference = refine_reference_ray(
-            visible_min, clipped_max, view.ds, frequencies,
-            options.length_scale_cm, options.integration_tolerance, sample_at);
+        std::vector<AdaptiveSegment> reference;
+        int occultation_recoveries = 0;
+        while (true) {
+          try {
+            std::size_t pilot_subdivisions = 1;
+            const std::size_t interval_count =
+                samples_for_span(clipped_max - visible_min, view.ds);
+            const std::size_t maximum_pilot_subdivisions =
+                kMaximumAdaptiveSegmentsPerRay / interval_count;
+            while (true) {
+              bool pilot_missed_emission = false;
+              reference = refine_reference_ray(
+                  visible_min, clipped_max, view.ds, frequencies,
+                  options.length_scale_cm, image_scales,
+                  options.integration_tolerance, pilot_subdivisions,
+                  pilot_missed_emission, sample_at);
+              if (!pilot_missed_emission) {
+                break;
+              }
+              if (pilot_subdivisions > maximum_pilot_subdivisions / 2) {
+                throw std::runtime_error(
+                    "adaptive pilot refinement could not resolve emission "
+                    "missed by the initial pilot");
+              }
+              pilot_subdivisions *= 2;
+            }
+            verify_reference_ray(
+                reference, (clipped_max - visible_min) *
+                               options.length_scale_cm,
+                frequencies, image_scales, options.length_scale_cm,
+                options.integration_tolerance, sample_at);
+            break;
+          } catch (const OpaqueIntersectionDetected& intersection) {
+            if (++occultation_recoveries > 8) {
+              throw std::runtime_error(
+                  "could not recover the nearest opaque boundary on an "
+                  "adaptive ray");
+            }
+            double recovered_min = visible_min;
+            const double recovery_spacing =
+                view.ds / std::pow(2.0, occultation_recoveries);
+            has_visible_material = clip_to_nearest_opaque_boundary(
+                intersection.position, clipped_max, recovery_spacing,
+                sample_at, recovered_min);
+            if (!has_visible_material) {
+              break;
+            }
+            visible_min = recovered_min;
+          }
+        }
+        if (!has_visible_material) {
+          host_offsets[pixel + 1] = packed_segments.size();
+          continue;
+        }
         const std::vector<std::vector<AdaptiveContext>> reference_contexts =
             build_segment_pilot_contexts(reference, frequencies,
-                                         options.length_scale_cm);
+                                         options.length_scale_cm,
+                                         image_scales);
         const std::vector<AdaptiveSegment> compressed =
             compress_ray_segments(
                 reference, frequencies, reference_contexts,
