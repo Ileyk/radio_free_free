@@ -15,5 +15,6 @@ time "$REPO_ROOT/build/rff-transfer" \
   --input occulted-flow.rff --output flow-spectrum.csv \
   --n0 1e9 --temperature0 3e5 --length0 70 \
   --frequency-min-hz 1e9 --frequency-max-hz 1e12 --frequency-count 100 \
-  --view-theta-deg 53 --view-phi-deg 0 --relative_intensity_threshold 1e-2
+  --view-theta-deg 53 --view-phi-deg 0 --relative_intensity_threshold 1e-2 \
+  --adaptive-longitudinal --integration-tolerance 1e-1
 rff-plot "$SCRIPT_DIR/flow-spectrum.csv"
