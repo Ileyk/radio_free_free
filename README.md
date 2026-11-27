@@ -249,21 +249,19 @@ each reference frequency is combined with a frequency-dependent image scale
 from the flow's optically-thin volume emissivity per projected area. This
 provides a nonzero absolute-budget scale even when an individual pilot ray
 misses emitting material. Such misses trigger a finer pilot and a rebuilt
-estimate. Absolute error budgets are distributed by path length, while
-relative budgets are distributed in quadrature. Refinement compares the
-coarse affine transfer operator with the composition of its two half-step
-operators, accounting for emission and transmission errors; relative checks
-are applied only when the corresponding contribution is significant relative
-to its local budget. When an interval passes, its two half-steps are retained.
-The refined reference ray is iteratively rechecked using updated incoming
-intensities and foreground transmission. Reference frequencies are spaced by
-half a decade over the requested frequency range. The default tolerance is
-`1e-3`. Neighboring intervals are then merged only when their transfer
-operators agree within that tolerance; the compressed ray is checked against
-the converged reference ray at every reference frequency, and the reference
-representation is used if verification fails. If refinement discovers an
-opaque intersection missed by the initial scan, the nearest visible boundary
-is recovered and the ray integration is repeated. Without
+estimate. Absolute error budgets are distributed by path length. Local
+refinement and merging rely on the physically weighted absolute error between
+affine transfer operators, accounting for both emission and transmission.
+When an interval passes, its two half-steps are retained. The refined
+reference ray is iteratively rechecked using updated incoming intensities and
+foreground transmission. Reference frequencies are spaced by half a decade
+over the requested frequency range. The default tolerance is `1e-3`.
+Neighboring intervals are then merged only when their transfer operators meet
+the weighted error budget; full-ray verification also checks relative error
+when the signal is significant, and the reference representation is used if
+verification fails. If refinement discovers an opaque intersection missed by
+the initial scan, the nearest visible boundary is recovered and the ray
+integration is repeated. Without
 `--adaptive-longitudinal`, the existing fixed spatial sampling is used.
 `--integration-tolerance` is only valid when adaptive integration is enabled.
 Reference frequencies include both requested band endpoints. Adaptive

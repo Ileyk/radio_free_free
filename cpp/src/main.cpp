@@ -829,29 +829,7 @@ bool refinement_criteria_pass(
              std::abs(context.incoming_intensity));
     const double local_budget =
         tolerance * context.ray_intensity * interval_fraction;
-    // The squared relative-error shares sum to the ray-level tolerance squared.
-    const double local_relative_tolerance =
-        tolerance * std::sqrt(interval_fraction);
     if (local_error > local_budget) {
-      passes = false;
-    }
-
-    const double emission_scale =
-        context.foreground_transmission *
-        std::max(std::abs(coarse.source_contribution), std::abs(fine_source));
-    if (emission_scale > local_budget &&
-        relative_difference(coarse.source_contribution, fine_source) >
-            local_relative_tolerance) {
-      passes = false;
-    }
-    const double transmission_scale =
-        context.foreground_transmission *
-        std::abs(context.incoming_intensity) *
-        std::max(std::abs(coarse.transmission),
-                 std::abs(fine_transmission));
-    if (transmission_scale > local_budget &&
-        relative_difference(coarse.transmission, fine_transmission) >
-            local_relative_tolerance) {
       passes = false;
     }
   }
@@ -1314,8 +1292,6 @@ bool merged_operator_matches(const std::vector<AdaptiveSegment>& reference,
         contexts[end - 1][frequency_index];
     const double local_budget =
         tolerance * incoming.ray_intensity * interval_fraction;
-    const double local_relative_tolerance =
-        tolerance * std::sqrt(interval_fraction);
     const double local_error =
         outgoing.foreground_transmission *
         (std::abs(reference_source -
@@ -1323,24 +1299,7 @@ bool merged_operator_matches(const std::vector<AdaptiveSegment>& reference,
          std::abs(reference_transmission -
                   candidate_operation.transmission) *
              std::abs(incoming.incoming_intensity));
-    const double emission_scale =
-        outgoing.foreground_transmission *
-        std::max(std::abs(reference_source),
-                 std::abs(candidate_operation.source_contribution));
-    const double transmission_scale =
-        outgoing.foreground_transmission *
-        std::abs(incoming.incoming_intensity) *
-        std::max(std::abs(reference_transmission),
-                 std::abs(candidate_operation.transmission));
-    if (local_error > local_budget ||
-        (emission_scale > local_budget &&
-         relative_difference(reference_source,
-                             candidate_operation.source_contribution) >
-             local_relative_tolerance) ||
-        (transmission_scale > local_budget &&
-         relative_difference(reference_transmission,
-                             candidate_operation.transmission) >
-             local_relative_tolerance)) {
+    if (local_error > local_budget) {
       return false;
     }
   }

@@ -45,18 +45,18 @@ finish() {
 }
 trap finish EXIT
 
-run_timed "Generate flow" rff-flow wind flow.rff --resolution 64 64 64 \
+run_timed "Generate flow" rff-flow wind flow.rff --resolution 256 256 256 \
   --inner-radius 1 --outer-radius 10 \
   --ni_Zi2_per_baryon 1 --eff_Z_i 1.2
-run_timed "Add sphere occultation" rff-occult flow.rff tmp.rff \
+run_timed "Star" rff-occult flow.rff tmp.rff \
   --shape sphere --center 0 0 0 --radius 1
-run_timed "Add cylinder occultation" rff-occult tmp.rff occulted-flow.rff \
+run_timed "Disk" rff-occult tmp.rff occulted-flow.rff \
   --shape cylinder \
   --center 0 2 0 --radius 0.8 --height 0.5
 run_timed "Compute spectrum" "$REPO_ROOT/build/rff-transfer" \
   --input occulted-flow.rff --output flow-spectrum.csv \
   --n0 1e9 --temperature0 3e5 --length0 70 \
   --frequency-min-hz 1e9 --frequency-max-hz 1e12 --frequency-count 100 \
-  --view-theta-deg 53 --view-phi-deg 0 --relative_intensity_threshold 1e-2 \
+  --view-theta-deg 53 --view-phi-deg 0 --relative_intensity_threshold 1e-1 \
   --adaptive-longitudinal --integration-tolerance 1e-1
 run_timed "Plot spectrum" rff-plot "$SCRIPT_DIR/flow-spectrum.csv"
