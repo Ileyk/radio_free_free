@@ -467,6 +467,7 @@ def plot_radio_output(
             )
             axis.set_title("Legacy radio spectrum (fixed-distance flux)")
         axis.set_xscale("log")
+        axis.set_ylim(1e-3, 1e1)
         plotted_flux = line.get_ydata()
         if np.all(plotted_flux > 0):
             axis.set_yscale("log")
@@ -525,7 +526,10 @@ def main() -> None:
         prog="rff-plot",
         description="Plot an image or spectrum CSV produced by rff-transfer",
     )
-    parser.add_argument("input", help="radio image or spectrum CSV")
+    parser.add_argument(
+        "input",
+        help="path to a radio image or spectrum CSV, including nested run folders",
+    )
     parser.add_argument(
         "--mode",
         choices=("auto", "image", "spectrum"),

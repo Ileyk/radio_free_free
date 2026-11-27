@@ -57,8 +57,50 @@ In this file, `R0` is the radial unit and `n0` is the number density at
 extends to the enclosing cube, but density, temperature, and abundances are
 zero outside the sphere. The inner sphere is vacuum (stellar interior),
 avoiding a singularity at the origin and keeping it resolved by the example
-grid. Within the spherical domain the wind has `T/T0 = 1` and pure-hydrogen
-abundances.
+grid. By default, within the spherical domain the wind has `T/T0 = 1` and
+pure-hydrogen abundances.
+
+## Prescribed flow functions
+
+Use the `functions` command to sample custom fields from a Python file on the
+requested Cartesian bounds and resolution:
+
+```sh
+rff-flow functions disk_flow.py runs/disk/flow.rff \
+  --coordinates cylindrical --bounds -10 10 -10 10 -5 5 \
+  --resolution 128 128 64
+```
+
+The file must define callable `density`, `temperature`,
+`electron_per_baryon`, and `ion_charge2_per_baryon` functions. Each receives
+three NumPy arrays at Cartesian cell centers, transformed to either
+cylindrical `(R, phi, z)` or spherical `(r, theta, phi)` coordinates. Lengths
+are in `R0` units, and angles are in radians; spherical `theta` is measured
+from +z and `phi` is the azimuth in `[0, 2*pi)`. Functions may return a scalar
+or an array broadcastable to the grid shape. `density` and `temperature` are
+dimensionless (`n_b/n0` and `T/T0`); the abundance fields are per baryon.
+
+For example, `disk_flow.py` can contain:
+
+```python
+import numpy as np
+
+def density(R, phi, z):
+    return np.exp(-R) * np.exp(-np.abs(z))
+
+def temperature(R, phi, z):
+    return 1.0
+
+def electron_per_baryon(R, phi, z):
+    return 1.0
+
+def ion_charge2_per_baryon(R, phi, z):
+    return 1.0
+```
+
+The Python input file is executed locally, so only use files you trust. Like
+the other `rff-flow` modes, this command writes both the `.rff` grid and its
+same-stem `.vtk` visualization file.
 
 To load simulation data, install the optional readers:
 
@@ -141,6 +183,12 @@ detected from its header:
 rff-plot wind-image.csv --distance-pc 100
 rff-plot wind-spectrum.csv --distance-pc 100
 ```
+
+For separate runs, keep a `run.sh` and outputs in a subfolder and pass their
+paths explicitly. For example, `rff-transfer --output runs/wind-a/spectrum.csv`
+creates missing output directories, and `rff-plot runs/wind-a/spectrum.csv`
+opens that result interactively. `rff-flow` and `rff-occult` also create the
+parent directories for their `.rff` and `.vtk` outputs.
 
 Image plots show specific intensity over the projected `u`/`v` plane, with
 frequency and viewing direction in the title when available; the distance-

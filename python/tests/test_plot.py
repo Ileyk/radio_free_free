@@ -75,7 +75,8 @@ class RadioOutputPlotTests(unittest.TestCase):
 
     def test_reads_distance_independent_spectrum(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "spectrum.csv"
+            path = Path(directory) / "run-001" / "spectrum.csv"
+            path.parent.mkdir()
             path.write_text(
                 "# projected intensity-area units: erg s^-1 Hz^-1\n"
                 "# n0_cm^-3: 1000000\n"

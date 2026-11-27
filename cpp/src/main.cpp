@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -650,11 +651,20 @@ void write_flow_grid_metadata(std::ostream& out, const Grid& grid) {
   out << '\n';
 }
 
+void create_output_parent_directories(const std::string& path) {
+  const std::filesystem::path parent =
+      std::filesystem::path(path).parent_path();
+  if (!parent.empty()) {
+    std::filesystem::create_directories(parent);
+  }
+}
+
 void write_image(const std::string& path, const ViewGeometry& view,
                  const Grid& grid,
                  const Kokkos::View<double**>& image,
                  const double frequency, const double pixel_area_cm2,
                  const Options& options) {
+  create_output_parent_directories(path);
   std::ofstream out(path);
   if (!out) {
     throw std::runtime_error("cannot open output image: " + path);
@@ -725,6 +735,7 @@ void write_spectrum(const std::string& path, const std::vector<double>& frequenc
                     const std::vector<double>& projected_intensity_areas,
                     const ViewGeometry& view, const Grid& grid,
                     const Options& options) {
+  create_output_parent_directories(path);
   std::ofstream out(path);
   if (!out) {
     throw std::runtime_error("cannot open output spectrum: " + path);

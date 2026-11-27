@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 
+from .custom import flow_from_python_file
 from .flow import PHYSICAL_FIELD_NAMES, resample_vtk
 from .wind import spherical_wind
 
@@ -29,6 +30,34 @@ def main() -> None:
         type=float,
         default=1.0,
         help="uniform effective ionic charge (default: 1)",
+    )
+
+    functions = commands.add_parser(
+        "functions",
+        help="evaluate prescribed field functions from a Python file",
+    )
+    functions.add_argument("input", help="Python file defining the flow fields")
+    functions.add_argument("output")
+    functions.add_argument(
+        "--bounds",
+        type=float,
+        nargs=6,
+        required=True,
+        metavar=("XMIN", "XMAX", "YMIN", "YMAX", "ZMIN", "ZMAX"),
+        help="Cartesian output-domain bounds in R0 units",
+    )
+    functions.add_argument(
+        "--resolution",
+        type=int,
+        nargs=3,
+        required=True,
+        metavar=("NX", "NY", "NZ"),
+    )
+    functions.add_argument(
+        "--coordinates",
+        choices=("spherical", "cylindrical"),
+        required=True,
+        help="coordinate system passed to the field functions",
     )
 
     vtk = commands.add_parser("vtk", help="resample a meshio-readable VTK dataset")
@@ -64,7 +93,7 @@ def main() -> None:
             ni_Zi2_per_baryon=args.ni_Zi2_per_baryon,
             eff_Z_i=args.eff_Z_i,
         )
-    else:
+    elif args.command == "vtk":
         fields = json.loads(args.fields)
         required_fields = set(PHYSICAL_FIELD_NAMES)
         if (not isinstance(fields, dict) or not required_fields.issubset(fields)
@@ -81,6 +110,13 @@ def main() -> None:
             number_density_scale=args.n0,
             temperature_scale=args.temperature0,
             density_kind=args.density_kind,
+        )
+    else:
+        flow = flow_from_python_file(
+            args.input,
+            tuple(args.bounds),
+            tuple(args.resolution),
+            args.coordinates,
         )
     vtk_output = flow.write_with_vtk(args.output)
     print(f"Wrote {args.output}: shape={flow.shape}, bounds={flow.bounds}")
