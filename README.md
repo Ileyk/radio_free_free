@@ -1,12 +1,14 @@
 # radio_free_free
 
-Prepare a three-dimensional flow in Python, then postprocess its thermal
-free-free radio emission with a Kokkos C++ ray tracer. The flow grid is
-dimensionless: physical density, temperature, length scale, frequency, and
-distance are supplied to the C++ program separately. Density is normalized
-with a baryon number density `n0` in cm^-3, and the reference length `R0` is
-provided as a number of solar radii. Changing source distance therefore only
-changes the reported flux, not the image intensity or transfer solution.
+Define the three-dimensional flow in Python and compute its thermal free-free
+radio emission with a Kokkos C++ ray tracer. `rff-transfer` accepts analytical
+Python models; the separate flow-preparation tools can still create `.rff`
+grids for visualization and preprocessing, but the transfer executable does
+not read them. Physical density, temperature, length scale, frequency, and
+distance are supplied separately. Density is normalized with a baryon number
+density `n0` in cm^-3, and the reference length `R0` is provided as a number
+of solar radii. Changing source distance therefore only changes the reported
+flux, not the image intensity or transfer solution.
 
 ## Flow representation
 
@@ -113,36 +115,41 @@ rff-transfer --input runs/1/model.py --output runs/1/flow-spectrum.csv \
   --n0 1e9 --temperature0 3e5 --length0 70 \
   --frequency-min-hz 1e9 --frequency-max-hz 1e12 --frequency-count 100 \
   --view-theta-deg 53 --view-phi-deg 0 \
+  --image-bounds -10 10 -10 10 --ray-bounds -10 10 \
   --image-resolution 96 96 --ray-samples 128
 ```
 
-The file defines Cartesian `bounds` in units of `R0`, a `coordinates` string
-(`"cartesian"`, `"cylindrical"`, or `"spherical"`), and vectorized
+The file defines a `coordinates` string (`"cartesian"`, `"cylindrical"`, or
+`"spherical"`) and vectorized
 `density(x1, x2, x3)`, `temperature(x1, x2, x3)`,
 `electron_per_baryon(x1, x2, x3)`, and
 `ion_charge2_per_baryon(x1, x2, x3)` functions. The argument coordinates are
 `(x, y, z)`, `(R, phi, z)`, or `(r, theta, phi)` respectively; angles are in
 radians, with spherical `theta` measured from +z. Functions receive NumPy
 arrays and may return arrays of matching shape or broadcastable scalars.
-`bounds` is ordered as `(xmin, xmax, ymin, ymax, zmin, zmax)`.
 Density and temperature are normalized by `n0` and `T0`; ionic abundances are
 dimensionless per-baryon ratios. `opaque_objects` is optional and may contain
 `{"shape": "sphere", "center": (x, y, z), "radius": r}` entries or
 `{"shape": "cylinder", "center": (x, y, z), "radius": r, "height": h,
 "axis": (ax, ay, az)}` entries. Dimensions are in `R0`; cylinder height is
-the full height and its axis is normalized by the solver. Objects must lie
-inside the computational bounds. Multiple and overlapping objects are
-supported; they are non-emitting and occult the flow analytically.
+the full height and its axis is normalized by the solver. Each opaque object
+must lie entirely inside the observer domain defined by `--image-bounds` and
+`--ray-bounds`. Multiple and overlapping objects are supported; they are
+non-emitting and occult the flow analytically.
 
-`--image-resolution NU NV` sets the regularly spaced image-plane pixels
-(default `128 128`); the initial extent is the projection of all domain
-corners. `--ray-samples NS` sets uniform midpoint samples along each visible
-ray (default `128`). The solver evaluates the four flow functions in batches
-on the host, caches physical ray-segment quantities, and performs the
-frequency-dependent transfer with Kokkos. Segment lengths are dimensionless
-in `R0` and are multiplied by `--length0` exactly once for optical depths;
-projected pixel areas receive the square of that scale exactly once. Adaptive
-longitudinal integration is currently available only for `.rff` input.
+Both bounds options are required for analytical input.
+`--image-bounds UMIN UMAX VMIN VMAX` sets the image-plane extent, while
+`--ray-bounds SMIN SMAX` sets the longitudinal integration interval. These
+observer-oriented coordinates are in `R0` units and are independent of the
+physical extent of the flow; physical cutoffs such as `Rin` and `Rout` belong
+in the analytical profiles. `--image-resolution NU NV` sets the regularly
+spaced pixels (default `128 128`), and `--ray-samples NS` sets uniform
+midpoint samples per visible ray (default `128`). The solver evaluates the
+four flow functions in batches on the host, caches physical ray-segment
+quantities, and performs the frequency-dependent transfer with Kokkos.
+Segment lengths are dimensionless in `R0` and are multiplied by `--length0`
+exactly once for optical depths; projected pixel areas receive the square of
+that scale exactly once. Adaptive longitudinal integration is not provided.
 
 Building `rff-transfer` requires a Python development package, NumPy available
 to the Python interpreter selected by CMake, and Kokkos. The Python dependency
@@ -152,8 +159,8 @@ the interpreter shown by CMake's `Found Python3` message. The example
 benchmark with a central sphere and finite cylinder. Its
 [`run.sh`](./runs/1/run.sh) runs the direct analytical solver. The CSV keeps
 the existing `frequency_hz,projected_intensity_area` spectrum format, with
-additional input, sampling, and viewing-direction metadata, so `rff-plot`
-continues to read it.
+additional input, sampling, observer-oriented bounds, and viewing-direction
+metadata, so `rff-plot` continues to read it.
 
 To load simulation data, install the optional readers:
 
@@ -279,11 +286,11 @@ dI_nu/ds  = -alpha_nu I_nu + j_nu
 ```
 
 The transfer is integrated from the observer-facing boundary toward the far
-side. For each cell, its contribution is added as
+side. For each segment, its contribution is added as
 `exp(-tau_foreground) B_nu(T) (1 - exp(-delta_tau))`, then its optical depth
 is added to `tau_foreground`. Both exponentials use stable forms near zero
 optical depth. This includes stimulated emission and does not assume the
-Rayleigh-Jeans limit. An opaque cell stops the traversal while preserving
+Rayleigh-Jeans limit. An opaque surface stops the traversal while preserving
 emission already accumulated in the foreground.
 
 For each ray, the solver caches the maximum temperature in the still-unvisited
@@ -295,67 +302,47 @@ intensity already accumulated in the foreground. The default
 `--relative_intensity_threshold` is also accepted. The value must be greater
 than zero and less than one.
 
-Adaptive longitudinal integration is opt-in with `--adaptive-longitudinal`.
-It first locates the nearest opaque boundary from the observer and restricts
-integration to the visible part of each ray. A coarse pilot integration at
-each reference frequency is combined with a frequency-dependent image scale
-from the flow's optically-thin volume emissivity per projected area. This
-provides a nonzero absolute-budget scale even when an individual pilot ray
-misses emitting material. Such misses trigger a finer pilot and a rebuilt
-estimate. Absolute error budgets are distributed by path length. Local
-refinement and merging rely on the physically weighted absolute error between
-affine transfer operators, accounting for both emission and transmission.
-When an interval passes, its two half-steps are retained. The refined
-reference ray is iteratively rechecked using updated incoming intensities and
-foreground transmission. Reference frequencies are spaced by half a decade
-over the requested frequency range. The default tolerance is `1e-3`.
-Neighboring intervals are then merged only when their transfer operators meet
-the weighted error budget; full-ray verification also checks relative error
-when the signal is significant, and the reference representation is used if
-verification fails. If refinement discovers an opaque intersection missed by
-the initial scan, the nearest visible boundary is recovered and the ray
-integration is repeated. Without
-`--adaptive-longitudinal`, the existing fixed spatial sampling is used.
-`--integration-tolerance` is only valid when adaptive integration is enabled.
-Reference frequencies include both requested band endpoints. Adaptive
-refinement, compression, and verification are host-side preprocessing; the
-per-frequency ray transfer still runs on the selected Kokkos backend.
+Analytical transfer currently uses uniform midpoint sampling controlled by
+`--ray-samples`. Adaptive longitudinal refinement and compression are not
+available. Hydrodynamical quantities are cached during ray construction, and
+frequency-dependent transfer runs on the selected Kokkos backend.
 
 Here `T` is the local physical temperature in K and `nu` is the observing
 frequency in Hz; `T_4 = T / 10^4 K` and `nu_9 = nu / 10^9 Hz`. For a flow
 with one ion species, `Z_i,eff` equals its ionic charge number. For mixtures,
 the flow's aggregate composition fields define the effective value as
 `(sum_i Z_i^2 n_i) / (sum_i Z_i n_i)`. `rff-transfer` computes `g_ff` from
-the interpolated temperature and effective charge at every transfer sample
+the evaluated temperature and effective charge at every transfer sample
 for every frequency in the spectrum.
 
 The flow preparation tools operate on dimensionless coordinates in units of
 `R0`. Set the physical size of one `R0` coordinate unit with
 `rff-transfer --length0`, in solar radii. The executable converts this value
-to centimeters internally. `rff-transfer` computes a spectrum and calculates
-the projected intensity-area integral at logarithmically spaced frequencies,
-including both endpoints:
+to centimeters internally. `rff-transfer` accepts analytical Python models and calculates the projected
+intensity-area integral at logarithmically spaced frequencies, including both
+endpoints:
 
 ```sh
-./build/rff-transfer --mode spectrum --input wind.rff --output wind-spectrum.csv \
+./build/rff-transfer --mode spectrum --input runs/1/model.py \
+  --output wind-spectrum.csv \
   --n0 5.98e5 --temperature0 1e4 --length0 215.61 \
   --frequency-min-hz 1e8 --frequency-max-hz 1e12 --frequency-count 100 \
   --view-theta-deg 30 --view-phi-deg 45 \
-  --relative-intensity-threshold 1e-3 \
-  --adaptive-longitudinal --integration-tolerance 1e-3
+  --image-bounds -10 10 -10 10 --ray-bounds -10 10 \
+  --image-resolution 128 128 --ray-samples 128 \
+  --relative-intensity-threshold 1e-3
 ```
 
 The spectrum CSV contains frequency in Hz and the projected intensity-area
 integral in `erg s^-1 Hz^-1`. The viewing-angle options apply to the spectrum.
 `rff-plot` converts this integral to observed flux density using
 `F_nu = integral / distance_cm^2`; flux density is displayed in mJy. The `.rff`
-flow no longer contains a Gaunt-factor field. Output CSV metadata stores
-`n0`, `T0`, and `R0` for spectrum scale
-annotation; frequency values remain in Hz in the file and are displayed in
-GHz. Transfer CSV metadata also stores the flow-grid resolution and bounds
-in `R0` units; `rff-plot` displays the resolution and box dimensions in the
-spectrum annotation. The CSV records `length0_cm` after converting the input
-solar radii to centimeters.
+file format remains available for flow preparation and visualization but is
+not accepted by `rff-transfer`. Output CSV metadata stores `n0`, `T0`, and
+`R0` for spectrum scale annotation, as well as observer-oriented image and
+ray bounds and sampling resolution. Frequency values remain in Hz in the file
+and are displayed in GHz. The CSV records `length0_cm` after converting the
+input solar radii to centimeters.
 
 Build against a Kokkos installation configured with CMake. `rff-transfer`
 embeds the selected Python interpreter, so it must have development headers

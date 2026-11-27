@@ -98,12 +98,16 @@ struct Options {
   std::size_t image_nu = 128;
   std::size_t image_nv = 128;
   std::size_t ray_samples = 128;
+  std::array<double, 4> image_bounds{};
+  std::array<double, 2> ray_bounds{};
   double theta_deg = 0.0;
   double phi_deg = 0.0;
   bool adaptive_longitudinal = false;
   bool integration_tolerance_given = false;
   bool image_resolution_given = false;
   bool ray_samples_given = false;
+  bool image_bounds_given = false;
+  bool ray_bounds_given = false;
 };
 
 struct Grid {
@@ -153,6 +157,8 @@ struct ImageGeometry {
   std::size_t ny;
   double u_min;
   double v_min;
+  double u_max;
+  double v_max;
   double du;
   double dv;
   Vector3 u;
@@ -173,7 +179,6 @@ struct AnalyticalModel {
   std::string filename;
   std::string module_name;
   std::string coordinates;
-  std::array<double, 6> bounds;
   std::vector<OpaqueObject> opaque_objects;
   bool owns_interpreter = false;
   PyObject* module = nullptr;
@@ -294,16 +299,15 @@ struct OpaqueIntersectionDetected {
 };
 
 void usage(std::ostream& out) {
-  out << "Usage: rff-transfer --input flow.rff|model.py --output result.csv"
+  out << "Usage: rff-transfer --input model.py --output result.csv"
          " --n0 cm^-3 --temperature0 K --length0 R_sun\n"
          "  Spectrum: [--mode spectrum] --frequency-min-hz Hz"
          " --frequency-max-hz Hz [--frequency-count N]\n"
          "  Stopping: [--relative-intensity-threshold (0,1)]"
          " (alias --relative_intensity_threshold; default 1e-3)\n"
-         "  Adaptive: [--adaptive-longitudinal]"
-         " [--integration-tolerance (0,1)] (default 1e-3)\n"
          "  Analytical Python input: [--image-resolution NU NV]"
-         " [--ray-samples NS]\n"
+         " --image-bounds UMIN UMAX VMIN VMAX"
+         " --ray-bounds SMIN SMAX [--ray-samples NS]\n"
          "  Viewing:  [--view-theta-deg 0..180] [--view-phi-deg degrees]\n"
          "Theta is measured from +z; phi is measured from +x in the xy plane.\n";
 }
@@ -370,6 +374,27 @@ Options parse_options(int argc, char** argv) {
       options.image_resolution_given = true;
       continue;
     }
+    if (key == "--image-bounds") {
+      if (i + 4 >= argc) {
+        throw std::invalid_argument(
+            "--image-bounds requires UMIN UMAX VMIN VMAX");
+      }
+      for (double& bound : options.image_bounds) {
+        bound = parse_finite(argv[++i], "--image-bounds");
+      }
+      options.image_bounds_given = true;
+      continue;
+    }
+    if (key == "--ray-bounds") {
+      if (i + 2 >= argc) {
+        throw std::invalid_argument("--ray-bounds requires SMIN and SMAX");
+      }
+      for (double& bound : options.ray_bounds) {
+        bound = parse_finite(argv[++i], "--ray-bounds");
+      }
+      options.ray_bounds_given = true;
+      continue;
+    }
     if (i + 1 >= argc) {
       throw std::invalid_argument("missing value for " + key);
     }
@@ -422,6 +447,11 @@ Options parse_options(int argc, char** argv) {
     throw std::invalid_argument(
         "--input, --output, --n0, --temperature0, and --length0 are required");
   }
+  if (std::filesystem::path(options.input).extension() != ".py") {
+    throw std::invalid_argument(
+        "rff-transfer accepts only analytical Python input files (.py); "
+        ".rff input is not supported");
+  }
   if (options.theta_deg < 0.0 || options.theta_deg > 180.0) {
     throw std::invalid_argument("--view-theta-deg must be between 0 and 180");
   }
@@ -450,15 +480,23 @@ Options parse_options(int argc, char** argv) {
       std::numeric_limits<std::size_t>::max() / options.image_nv) {
     throw std::invalid_argument("--image-resolution dimensions overflow");
   }
-  if (std::filesystem::path(options.input).extension() == ".py" &&
-      options.adaptive_longitudinal) {
+  if (options.image_bounds_given &&
+      !(options.image_bounds[0] < options.image_bounds[1] &&
+        options.image_bounds[2] < options.image_bounds[3])) {
+    throw std::invalid_argument(
+        "--image-bounds must contain increasing U and V ranges");
+  }
+  if (options.ray_bounds_given &&
+      !(options.ray_bounds[0] < options.ray_bounds[1])) {
+    throw std::invalid_argument("--ray-bounds requires SMIN less than SMAX");
+  }
+  if (options.adaptive_longitudinal) {
     throw std::invalid_argument(
         "--adaptive-longitudinal is not supported for analytical input");
   }
-  if (std::filesystem::path(options.input).extension() != ".py" &&
-      (options.image_resolution_given || options.ray_samples_given)) {
+  if (!options.image_bounds_given || !options.ray_bounds_given) {
     throw std::invalid_argument(
-        "--image-resolution and --ray-samples require analytical Python input");
+        "analytical input requires --image-bounds and --ray-bounds");
   }
   return options;
 }
@@ -670,8 +708,7 @@ double python_dictionary_number(PyObject* dictionary, const char* key,
   return number;
 }
 
-std::vector<OpaqueObject> parse_opaque_objects(
-    PyObject* objects, const std::array<double, 6>& bounds) {
+std::vector<OpaqueObject> parse_opaque_objects(PyObject* objects) {
   PyObjectRef sequence(
       PySequence_Fast(objects, "opaque_objects must be a sequence"));
   if (sequence.get() == nullptr) {
@@ -729,33 +766,6 @@ std::vector<OpaqueObject> parse_opaque_objects(
           description + " shape must be 'sphere' or 'cylinder'");
     }
 
-    std::array<double, 3> half_extent{{object.radius, object.radius,
-                                       object.radius}};
-    if (object.shape == OpaqueObject::Shape::Cylinder) {
-      const double half_height = object.height * 0.5;
-      half_extent = {{
-          half_height * std::abs(object.axis.x) +
-              object.radius *
-                  std::sqrt(std::max(0.0, 1.0 - object.axis.x * object.axis.x)),
-          half_height * std::abs(object.axis.y) +
-              object.radius *
-                  std::sqrt(std::max(0.0, 1.0 - object.axis.y * object.axis.y)),
-          half_height * std::abs(object.axis.z) +
-              object.radius *
-                  std::sqrt(std::max(0.0, 1.0 - object.axis.z * object.axis.z)),
-      }};
-    }
-    const std::array<double, 3> center_coordinates{{
-        object.center.x, object.center.y, object.center.z}};
-    for (std::size_t axis = 0; axis < 3; ++axis) {
-      if (center_coordinates[axis] - half_extent[axis] <
-              bounds[2 * axis] ||
-          center_coordinates[axis] + half_extent[axis] >
-              bounds[2 * axis + 1]) {
-        throw std::runtime_error(description +
-                                 " must lie inside the computational domain");
-      }
-    }
     parsed.push_back(object);
   }
   return parsed;
@@ -914,20 +924,6 @@ AnalyticalModel::AnalyticalModel(const std::string& path)
       throw_python_error("executing analytical input file");
     }
 
-    PyObjectRef bounds_object(
-        PyObject_GetAttrString(loaded_module.get(), "bounds"));
-    if (bounds_object.get() == nullptr) {
-      throw_python_error("analytical input must define 'bounds'");
-    }
-    const std::vector<double> parsed_bounds =
-        python_number_sequence(bounds_object.get(), 6, "bounds");
-    std::copy(parsed_bounds.begin(), parsed_bounds.end(), bounds.begin());
-    if (!(bounds[0] < bounds[1] && bounds[2] < bounds[3] &&
-          bounds[4] < bounds[5])) {
-      throw std::runtime_error(
-          "bounds must contain increasing Cartesian lower/upper pairs");
-    }
-
     PyObjectRef coordinates_object(
         PyObject_GetAttrString(loaded_module.get(), "coordinates"));
     if (coordinates_object.get() == nullptr) {
@@ -963,7 +959,7 @@ AnalyticalModel::AnalyticalModel(const std::string& path)
       throw_python_error("creating an empty opaque_objects list");
     }
     if (objects_object.get() != Py_None) {
-      opaque_objects = parse_opaque_objects(objects_object.get(), bounds);
+      opaque_objects = parse_opaque_objects(objects_object.get());
     }
 
     PyObjectRef density_object(
@@ -1186,8 +1182,7 @@ ViewGeometry make_view_geometry(const Grid& grid, const Options& options) {
           (s_max - s_min) / nlos, u, v, los};
 }
 
-ImageGeometry make_image_geometry(const std::array<double, 6>& bounds,
-                                  const Options& options) {
+ImageGeometry make_image_geometry(const Options& options) {
   const double theta = options.theta_deg * kPi / 180.0;
   const double phi = options.phi_deg * kPi / 180.0;
   const Vector3 los{std::sin(theta) * std::cos(phi),
@@ -1205,55 +1200,52 @@ ImageGeometry make_image_geometry(const std::array<double, 6>& bounds,
   }
   const Vector3 u = normalized(horizontal);
   const Vector3 v = normalized(cross(los, u));
-  double u_min = std::numeric_limits<double>::infinity();
-  double u_max = -u_min;
-  double v_min = u_min;
-  double v_max = -u_min;
-  for (int corner = 0; corner < 8; ++corner) {
-    const Vector3 point{
-        bounds[(corner & 1) ? 1 : 0],
-        bounds[(corner & 2) ? 3 : 2],
-        bounds[(corner & 4) ? 5 : 4],
-    };
-    const double projected_u = dot(point, u);
-    const double projected_v = dot(point, v);
-    u_min = std::min(u_min, projected_u);
-    u_max = std::max(u_max, projected_u);
-    v_min = std::min(v_min, projected_v);
-    v_max = std::max(v_max, projected_v);
-  }
-  return {options.image_nu, options.image_nv, u_min, v_min,
+  const double u_min = options.image_bounds[0];
+  const double u_max = options.image_bounds[1];
+  const double v_min = options.image_bounds[2];
+  const double v_max = options.image_bounds[3];
+  return {options.image_nu, options.image_nv, u_min, v_min, u_max, v_max,
           (u_max - u_min) / options.image_nu,
           (v_max - v_min) / options.image_nv, u, v, los};
 }
 
-bool ray_domain_interval(const Vector3& origin, const Vector3& direction,
-                         const std::array<double, 6>& bounds,
-                         double& s_min, double& s_max) {
-  s_min = -std::numeric_limits<double>::infinity();
-  s_max = std::numeric_limits<double>::infinity();
-  const std::array<double, 3> point{{origin.x, origin.y, origin.z}};
-  const std::array<double, 3> vector{{direction.x, direction.y, direction.z}};
-  for (std::size_t axis = 0; axis < 3; ++axis) {
-    if (std::abs(vector[axis]) < 1.0e-14) {
-      if (point[axis] < bounds[2 * axis] ||
-          point[axis] > bounds[2 * axis + 1]) {
-        return false;
-      }
-      continue;
-    }
-    double first = (bounds[2 * axis] - point[axis]) / vector[axis];
-    double second = (bounds[2 * axis + 1] - point[axis]) / vector[axis];
-    if (first > second) {
-      std::swap(first, second);
-    }
-    s_min = std::max(s_min, first);
-    s_max = std::min(s_max, second);
-    if (s_min >= s_max) {
-      return false;
-    }
+double opaque_object_extent(const OpaqueObject& object,
+                            const Vector3& direction) {
+  if (object.shape == OpaqueObject::Shape::Sphere) {
+    return object.radius;
   }
-  return std::isfinite(s_min) && std::isfinite(s_max) && s_min < s_max;
+  const double axis_projection = dot(object.axis, direction);
+  return 0.5 * object.height * std::abs(axis_projection) +
+         object.radius *
+             std::sqrt(std::max(0.0, 1.0 - axis_projection * axis_projection));
+}
+
+void validate_opaque_objects(const std::vector<OpaqueObject>& objects,
+                             const ImageGeometry& image,
+                             const std::array<double, 2>& ray_bounds) {
+  for (std::size_t i = 0; i < objects.size(); ++i) {
+    const OpaqueObject& object = objects[i];
+    const auto validate_axis = [&](const Vector3& direction,
+                                   const double lower_bound,
+                                   const double upper_bound,
+                                   const char* axis_name) {
+      const double center_projection = dot(object.center, direction);
+      const double extent = opaque_object_extent(object, direction);
+      const double tolerance =
+          1.0e-12 *
+          std::max({1.0, std::abs(lower_bound), std::abs(upper_bound),
+                    std::abs(center_projection) + extent});
+      if (center_projection - extent < lower_bound - tolerance ||
+          center_projection + extent > upper_bound + tolerance) {
+        throw std::runtime_error(
+            "opaque_objects[" + std::to_string(i) +
+            "] must lie entirely inside the observer domain on " + axis_name);
+      }
+    };
+    validate_axis(image.u, image.u_min, image.u_max, "u");
+    validate_axis(image.v, image.v_min, image.v_max, "v");
+    validate_axis(image.los, ray_bounds[0], ray_bounds[1], "s");
+  }
 }
 
 bool ray_object_interval(const Vector3& origin, const Vector3& direction,
@@ -2412,25 +2404,21 @@ AdaptiveRaySamples build_analytical_ray_samples(
         image.u.x * u_coordinate + image.v.x * v_coordinate,
         image.u.y * u_coordinate + image.v.y * v_coordinate,
         image.u.z * u_coordinate + image.v.z * v_coordinate};
-    double domain_min = 0.0;
-    double domain_max = 0.0;
-    if (ray_domain_interval(origin, image.los, model.bounds, domain_min,
-                            domain_max)) {
-      double visible_min = domain_min;
-      if (visible_ray_interval(origin, image.los, model.opaque_objects,
-                               domain_min, domain_max, visible_min)) {
-        const double segment_length =
-            (domain_max - visible_min) / options.ray_samples;
-        if (segment_length > 0.0 && std::isfinite(segment_length)) {
-          for (std::size_t sample = 0; sample < options.ray_samples; ++sample) {
-            const double s =
-                visible_min + (sample + 0.5) * segment_length;
-            positions.push_back(
-                {origin.x + image.los.x * s,
-                 origin.y + image.los.y * s,
-                 origin.z + image.los.z * s});
-            segment_lengths.push_back(segment_length);
-          }
+    const double domain_min = options.ray_bounds[0];
+    const double domain_max = options.ray_bounds[1];
+    double visible_min = domain_min;
+    if (visible_ray_interval(origin, image.los, model.opaque_objects,
+                             domain_min, domain_max, visible_min)) {
+      const double segment_length =
+          (domain_max - visible_min) / options.ray_samples;
+      if (segment_length > 0.0 && std::isfinite(segment_length)) {
+        for (std::size_t sample = 0; sample < options.ray_samples; ++sample) {
+          const double s = visible_min + (sample + 0.5) * segment_length;
+          positions.push_back(
+              {origin.x + image.los.x * s,
+               origin.y + image.los.y * s,
+               origin.z + image.los.z * s});
+          segment_lengths.push_back(segment_length);
         }
       }
     }
@@ -2774,14 +2762,10 @@ void write_analytical_spectrum(
   out << "# image_resolution: " << image.nx << ',' << image.ny << '\n';
   out << "# ray_samples: " << options.ray_samples << '\n';
   out << "# ray_segment_length_units: R0\n";
-  out << "# domain_bounds_r0: ";
-  for (std::size_t i = 0; i < model.bounds.size(); ++i) {
-    if (i > 0) {
-      out << ',';
-    }
-    out << model.bounds[i];
-  }
-  out << '\n';
+  out << "# image_bounds_r0: " << image.u_min << ',' << image.u_max << ','
+      << image.v_min << ',' << image.v_max << '\n';
+  out << "# ray_bounds_r0: " << options.ray_bounds[0] << ','
+      << options.ray_bounds[1] << '\n';
   out << "# longitudinal_integration: uniform_midpoint\n";
   out << "# line_of_sight: " << image.los.x << ',' << image.los.y << ','
       << image.los.z << '\n';
@@ -2796,7 +2780,8 @@ void write_analytical_spectrum(
 
 void run_analytical(const Options& options) {
   const AnalyticalModel model(options.input);
-  const ImageGeometry image = make_image_geometry(model.bounds, options);
+  const ImageGeometry image = make_image_geometry(options);
+  validate_opaque_objects(model.opaque_objects, image, options.ray_bounds);
   const std::vector<std::array<double, 2>> ray_coordinates =
       regular_image_ray_coordinates(image);
   const AdaptiveRaySamples ray_samples = build_analytical_ray_samples(

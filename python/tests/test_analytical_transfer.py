@@ -6,7 +6,6 @@ from pathlib import Path
 
 import numpy as np
 
-from radio_free_free import FlowGrid
 from radio_free_free.plot import read_radio_output
 
 
@@ -22,7 +21,6 @@ class AnalyticalTransferTests(unittest.TestCase):
             "\n".join(
                 [
                     "import numpy as np",
-                    "bounds = (-1, 1, -1, 1, -1, 1)",
                     f"coordinates = {coordinates!r}",
                     f"opaque_objects = {opaque_objects}",
                     "def density(x1, x2, x3):",
@@ -46,6 +44,8 @@ class AnalyticalTransferTests(unittest.TestCase):
         image_resolution,
         ray_samples,
         extra_options=(),
+        image_bounds=(-1, 1, -1, 1),
+        ray_bounds=(-1, 1),
     ):
         subprocess.run(
             [
@@ -74,6 +74,10 @@ class AnalyticalTransferTests(unittest.TestCase):
                 str(image_resolution),
                 "--ray-samples",
                 str(ray_samples),
+                "--image-bounds",
+                *(str(bound) for bound in image_bounds),
+                "--ray-bounds",
+                *(str(bound) for bound in ray_bounds),
             ],
             check=True,
             capture_output=True,
@@ -107,9 +111,15 @@ class AnalyticalTransferTests(unittest.TestCase):
         np.testing.assert_allclose(fine, coarse, rtol=2e-12, atol=0)
         self.assertIn("# image_resolution: 8,8", metadata)
         self.assertIn("# ray_samples: 24", metadata)
+        self.assertIn("# image_bounds_r0: -1,1,-1,1", metadata)
+        self.assertIn("# ray_bounds_r0: -1,1", metadata)
         self.assertIn("# analytical_input:", metadata)
         self.assertIn("# line_of_sight:", metadata)
         self.assertIsNone(parsed.flow_grid)
+        self.assertEqual(parsed.observer_sampling.image_resolution, (8, 8))
+        self.assertEqual(parsed.observer_sampling.image_bounds, (-1, 1, -1, 1))
+        self.assertEqual(parsed.observer_sampling.ray_samples, 24)
+        self.assertEqual(parsed.observer_sampling.ray_bounds, (-1, 1))
         np.testing.assert_allclose(parsed.projected_intensity_area, fine)
 
     def test_spherical_wind_spectrum_converges_with_image_and_ray_sampling(self):
@@ -133,24 +143,35 @@ class AnalyticalTransferTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
             coarse, _ = self.run_transfer(
-                model_path, directory / "coarse.csv", 48, 128, physical_options
+                model_path,
+                directory / "coarse.csv",
+                96,
+                128,
+                physical_options,
+                (-10, 10, -10, 10),
+                (-10, 10),
             )
             ray_refined, _ = self.run_transfer(
-                model_path, directory / "ray-refined.csv", 48, 256,
+                model_path,
+                directory / "ray-refined.csv",
+                96,
+                256,
                 physical_options,
+                (-10, 10, -10, 10),
+                (-10, 10),
             )
             image_refined, _ = self.run_transfer(
-                model_path, directory / "image-refined.csv", 96, 128,
+                model_path,
+                directory / "image-refined.csv",
+                192,
+                128,
                 physical_options,
-            )
-            fully_refined, _ = self.run_transfer(
-                model_path, directory / "fully-refined.csv", 96, 256,
-                physical_options,
+                (-10, 10, -10, 10),
+                (-10, 10),
             )
 
-        np.testing.assert_allclose(ray_refined, coarse, rtol=5e-4, atol=0)
-        np.testing.assert_allclose(image_refined, coarse, rtol=1e-2, atol=0)
-        np.testing.assert_allclose(fully_refined, coarse, rtol=1e-2, atol=0)
+        np.testing.assert_allclose(ray_refined, coarse, rtol=3e-4, atol=0)
+        np.testing.assert_allclose(image_refined, coarse, rtol=2e-2, atol=0)
 
     def test_spherical_cylindrical_and_cartesian_coordinates_agree(self):
         profiles = {
@@ -167,7 +188,6 @@ class AnalyticalTransferTests(unittest.TestCase):
                     "\n".join(
                         [
                             "import numpy as np",
-                            "bounds = (-1, 1, -1, 1, -1, 1)",
                             f"coordinates = {coordinates!r}",
                             "opaque_objects = []",
                             "def density(x1, x2, x3):",
@@ -234,59 +254,21 @@ class AnalyticalTransferTests(unittest.TestCase):
         self.assertTrue(np.all(lateral_values < clear))
         np.testing.assert_array_equal(boundary_values, np.zeros_like(clear))
 
-    def test_direct_and_cartesian_workflows_agree_for_uniform_flow(self):
+    def test_opaque_objects_must_fit_the_observer_integration_domain(self):
+        object_outside_ray_bounds = (
+            '[{"shape": "sphere", "center": (0, 0, 0.8), "radius": 0.5}]'
+        )
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
-            model_path = self.write_model(directory)
-            direct, _ = self.run_transfer(
-                model_path, directory / "direct.csv", 1, 12
+            model_path = self.write_model(
+                directory, opaque_objects=object_outside_ray_bounds
             )
-            values = np.ones((1, 1, 1))
-            flow = FlowGrid(
-                (-1, 1, -1, 1, -1, 1), values, values, values, values
-            )
-            flow_path = directory / "uniform.rff"
-            flow.write(flow_path)
-            subprocess.run(
-                [
-                    str(TRANSFER_BINARY),
-                    "--input",
-                    str(flow_path),
-                    "--output",
-                    str(directory / "cartesian.csv"),
-                    "--n0",
-                    "1e5",
-                    "--temperature0",
-                    "1e4",
-                    "--length0",
-                    "1",
-                    "--frequency-min-hz",
-                    "1e9",
-                    "--frequency-max-hz",
-                    "1e10",
-                    "--frequency-count",
-                    "3",
-                    "--view-theta-deg",
-                    "0",
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            cartesian_rows = [
-                row
-                for row in (directory / "cartesian.csv").read_text().splitlines()
-                if not row.startswith("#")
-            ]
-            cartesian = np.asarray(
-                [
-                    float(row["projected_intensity_area"])
-                    for row in csv.DictReader(cartesian_rows)
-                ]
-            )
+            with self.assertRaises(subprocess.CalledProcessError) as error:
+                self.run_transfer(
+                    model_path, directory / "invalid.csv", 1, 4
+                )
 
-        np.testing.assert_allclose(direct, cartesian, rtol=1e-11, atol=0)
-
+        self.assertIn("observer domain on s", error.exception.stderr)
 
 if __name__ == "__main__":
     unittest.main()

@@ -44,6 +44,14 @@ class FlowGridParameters:
 
 
 @dataclass(frozen=True)
+class ObserverSamplingParameters:
+    image_resolution: Tuple[int, int]
+    image_bounds: Tuple[float, float, float, float]
+    ray_samples: int
+    ray_bounds: Tuple[float, float]
+
+
+@dataclass(frozen=True)
 class RadioImage:
     u: NDArray[np.float64]
     v: NDArray[np.float64]
@@ -65,6 +73,7 @@ class RadioSpectrum:
     projected_intensity_area: Optional[NDArray[np.float64]] = None
     scales: Optional[PhysicalScales] = None
     flow_grid: Optional[FlowGridParameters] = None
+    observer_sampling: Optional[ObserverSamplingParameters] = None
 
 
 RadioOutput = Union[RadioImage, RadioSpectrum]
@@ -153,6 +162,59 @@ def _read_flow_grid_parameters(
     )
 
 
+def _read_observer_sampling_parameters(
+    metadata: Dict[str, str],
+) -> Optional[ObserverSamplingParameters]:
+    keys = (
+        "image_resolution",
+        "image_bounds_r0",
+        "ray_samples",
+        "ray_bounds_r0",
+    )
+    present = [key in metadata for key in keys]
+    if not any(present):
+        return None
+    if not all(present):
+        raise ValueError("CSV must provide all observer sampling metadata values")
+
+    image_resolution = _float_vector(
+        metadata["image_resolution"].split(","), "image_resolution"
+    )
+    image_bounds = _float_vector(
+        metadata["image_bounds_r0"].split(","), "image_bounds_r0"
+    )
+    ray_samples = _float_vector([metadata["ray_samples"]], "ray_samples")
+    ray_bounds = _float_vector(
+        metadata["ray_bounds_r0"].split(","), "ray_bounds_r0"
+    )
+    if (
+        image_resolution.size != 2
+        or np.any(image_resolution < 1)
+        or np.any(image_resolution != np.floor(image_resolution))
+    ):
+        raise ValueError("image_resolution must contain two positive integers")
+    if image_bounds.size != 4 or not (
+        image_bounds[0] < image_bounds[1]
+        and image_bounds[2] < image_bounds[3]
+    ):
+        raise ValueError("image_bounds_r0 must contain increasing U and V ranges")
+    if (
+        ray_samples.size != 1
+        or ray_samples[0] < 1
+        or ray_samples[0] != np.floor(ray_samples[0])
+    ):
+        raise ValueError("ray_samples must be a positive integer")
+    if ray_bounds.size != 2 or ray_bounds[0] >= ray_bounds[1]:
+        raise ValueError("ray_bounds_r0 must contain an increasing S range")
+
+    return ObserverSamplingParameters(
+        tuple(int(value) for value in image_resolution),
+        tuple(float(value) for value in image_bounds),
+        int(ray_samples[0]),
+        tuple(float(value) for value in ray_bounds),
+    )
+
+
 def _read_linford_spectrum() -> Tuple[
     NDArray[np.float64], NDArray[np.float64]
 ]:
@@ -185,6 +247,7 @@ def read_radio_output(
     header = rows[0]
     scales = _read_physical_scales(metadata)
     flow_grid = _read_flow_grid_parameters(metadata)
+    observer_sampling = _read_observer_sampling_parameters(metadata)
 
     if mode == "auto":
         if header and header[0] in ("u_over_R0", "x_over_R0"):
@@ -280,6 +343,7 @@ def read_radio_output(
             values,
             scales,
             flow_grid,
+            observer_sampling,
         )
     return RadioSpectrum(
         frequencies,
@@ -287,6 +351,7 @@ def read_radio_output(
         metadata.get("integrated flux density units", "Jy"),
         scales=scales,
         flow_grid=flow_grid,
+        observer_sampling=observer_sampling,
     )
 
 
@@ -498,6 +563,29 @@ def plot_radio_output(
                 transform=axis.transAxes,
                 ha="right",
                 va="bottom",
+                bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
+                zorder=10,
+            )
+        if output.observer_sampling is not None:
+            sampling = output.observer_sampling
+            nu, nv = sampling.image_resolution
+            u_min, u_max, v_min, v_max = sampling.image_bounds
+            s_min, s_max = sampling.ray_bounds
+            sampling_text = (
+                f"Screen: {nu} x {nv}\n"
+                f"u: [{u_min:.3g}, {u_max:.3g}], "
+                f"v: [{v_min:.3g}, {v_max:.3g}] R0\n"
+                f"Rays: {sampling.ray_samples} samples\n"
+                f"s: [{s_min:.3g}, {s_max:.3g}] R0"
+            )
+            axis.text(
+                0.02,
+                0.98,
+                sampling_text,
+                transform=axis.transAxes,
+                ha="left",
+                va="top",
+                fontsize="small",
                 bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
                 zorder=10,
             )

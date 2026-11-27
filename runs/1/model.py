@@ -1,13 +1,9 @@
 import numpy as np
 
-# Computational domain in units of R0
-bounds = (-10, 10, -10, 10, -10, 10)
-
 coordinates = "spherical"
 
 # Physical model parameters
 Rin = 1.0
-Rout = 10.0
 Zeff = 1.2
 YZ2 = 1.0
 
@@ -19,7 +15,7 @@ def density(r, theta, phi):
         1.0,
         r**2,
         out=np.zeros_like(r),
-        where=(r >= Rin) & (r <= Rout)
+        where=(r >= Rin)
     )
 
 

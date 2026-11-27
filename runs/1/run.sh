@@ -50,5 +50,6 @@ run_timed "Compute spectrum" "$REPO_ROOT/build/rff-transfer" \
   --n0 1e9 --temperature0 3e5 --length0 70 \
   --frequency-min-hz 1e9 --frequency-max-hz 1e12 --frequency-count 100 \
   --view-theta-deg 53 --view-phi-deg 0 --relative_intensity_threshold 1e-1 \
-  --image-resolution 256 256 --ray-samples 256
+  --image-bounds -10 10 -10 10 --ray-bounds -10 10 \
+  --image-resolution 512 512 --ray-samples 512
 run_timed "Plot spectrum" rff-plot "$SCRIPT_DIR/flow-spectrum.csv"

@@ -6,6 +6,7 @@ import numpy as np
 
 from radio_free_free.plot import (
     FlowGridParameters,
+    ObserverSamplingParameters,
     PhysicalScales,
     RadioImage,
     RadioSpectrum,
@@ -84,6 +85,10 @@ class RadioOutputPlotTests(unittest.TestCase):
                 "# length0_cm: 69570000000\n"
                 "# flow_resolution: 4,5,6\n"
                 "# flow_bounds_r0: -2,2,-3,3,-4,4\n"
+                "# image_resolution: 96,64\n"
+                "# image_bounds_r0: -10,10,-8,8\n"
+                "# ray_samples: 128\n"
+                "# ray_bounds_r0: -10,10\n"
                 "frequency_hz,projected_intensity_area\n"
                 "1000000000,1e20\n"
                 "10000000000,2e20\n"
@@ -100,6 +105,43 @@ class RadioOutputPlotTests(unittest.TestCase):
         self.assertEqual(output.scales.length_solar_radii, 1.0)
         self.assertEqual(output.flow_grid.resolution, (4, 5, 6))
         self.assertEqual(output.flow_grid.box_dimensions, (4.0, 6.0, 8.0))
+        self.assertEqual(
+            output.observer_sampling,
+            ObserverSamplingParameters(
+                (96, 64), (-10.0, 10.0, -8.0, 8.0), 128, (-10.0, 10.0)
+            ),
+        )
+
+    def test_plots_observer_sampling_insert(self):
+        try:
+            import matplotlib
+        except ImportError:
+            self.skipTest("Matplotlib is an optional dependency")
+        matplotlib.use("Agg", force=True)
+        from matplotlib import pyplot as plt
+
+        spectrum = RadioSpectrum(
+            np.asarray([1e9, 1e10]),
+            np.asarray([0.1, 0.25]),
+            "Jy",
+            observer_sampling=ObserverSamplingParameters(
+                (96, 64), (-10.0, 10.0, -8.0, 8.0), 128, (-10.0, 10.0)
+            ),
+        )
+        figure, _ = plot_radio_output(spectrum)
+        try:
+            inserts = [
+                text.get_text()
+                for text in figure.axes[0].texts
+                if text.get_text().startswith("Screen:")
+            ]
+            self.assertEqual(len(inserts), 1)
+            self.assertIn("Screen: 96 x 64", inserts[0])
+            self.assertIn("u: [-10, 10], v: [-8, 8] R0", inserts[0])
+            self.assertIn("Rays: 128 samples", inserts[0])
+            self.assertIn("s: [-10, 10] R0", inserts[0])
+        finally:
+            plt.close(figure)
 
     def test_reads_legacy_xy_image_output(self):
         with tempfile.TemporaryDirectory() as directory:
